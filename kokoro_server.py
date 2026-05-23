@@ -9,10 +9,12 @@ GET  /health     -> status
 
 import argparse
 import base64
+import ipaddress
 import io
 import json
 import os
 import re
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -34,9 +36,10 @@ DEFAULT_VOICE = 'af_bella'
 # --- Globals ---
 pipeline = None
 pipeline_lock = threading.Lock()
-VISION_MODEL = os.environ.get('VISION_MODEL', 'qwen3.5:4b')
+VISION_MODEL = os.environ.get('VISION_MODEL', 'gemma4:31b:cloud')
 VISION_API_BASE = os.environ.get('VISION_API_BASE', 'http://127.0.0.1:11434')
 VISION_API_KEY = os.environ.get('VISION_API_KEY', 'ollama')
+OLLAMA_STARTUP_TIMEOUT = float(os.environ.get('OLLAMA_STARTUP_TIMEOUT', '15'))
 
 OCR_SYSTEM_PROMPT_PLAIN = """Transcribe all readable text from this screenshot. Output ONLY the transcribed text, nothing else. Do not describe the image."""
 OCR_SYSTEM_PROMPT_CONSTRAINED = """You are an OCR assistant. Read the text in the image and follow the user's instructions exactly. Do not describe the image."""
@@ -94,7 +97,123 @@ def get_pipeline():
 
 
 OCR_MAX_RETRIES = 3
-OCR_TIMEOUT = 60  # per attempt — 3 retries × 25s
+OCR_TIMEOUT = 35  # per attempt — 3 retries × 25s
+
+def _api_base_parts(api_base: str):
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(api_base)
+    scheme = parsed.scheme or 'http'
+    hostname = parsed.hostname or '127.0.0.1'
+    port = parsed.port or (443 if scheme == 'https' else 80)
+    return scheme, hostname, port
+
+
+def _format_api_base(scheme: str, host: str, port: int) -> str:
+    try:
+        ipaddress.ip_address(host)
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+    except ValueError:
+        pass
+    return f'{scheme}://{host}:{port}'
+
+
+def _read_linux_default_gateway() -> str | None:
+    try:
+        with open('/proc/net/route') as f:
+            next(f, None)
+            for line in f:
+                fields = line.strip().split()
+                if len(fields) < 3 or fields[1] != '00000000':
+                    continue
+                raw = bytes.fromhex(fields[2])
+                return str(ipaddress.IPv4Address(raw[::-1]))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_vision_api_bases() -> list[str]:
+    """Return the mirrored and non-mirrored WSL Ollama API bases."""
+    scheme, hostname, port = _api_base_parts(VISION_API_BASE)
+    candidates = [_format_api_base(scheme, '127.0.0.1', port)]
+
+    gateway = _read_linux_default_gateway()
+    if gateway:
+        candidates.append(_format_api_base(scheme, gateway, port))
+    elif hostname not in ('127.0.0.1', 'localhost', '::1'):
+        candidates.append(_format_api_base(scheme, hostname, port))
+
+    # Keep exactly two addresses when a second WSL route exists, while avoiding
+    # duplicates if WSL reports loopback as its default route.
+    seen = set()
+    unique = []
+    for candidate in candidates:
+        candidate = candidate.rstrip('/')
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def _ollama_is_running(api_base: str, timeout: float = 1.0) -> bool:
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f'{api_base}/api/version', timeout=timeout):
+            return True
+    except (TimeoutError, urllib.error.URLError, OSError):
+        return False
+
+
+def ensure_ollama_running() -> None:
+    """Start a local Ollama server if the configured API routes are offline."""
+    api_bases = get_vision_api_bases()
+    if any(_ollama_is_running(api_base) for api_base in api_bases):
+        print(f"[OLLAMA] Already running at one of: {', '.join(api_bases)}", flush=True)
+        return
+
+    ollama_path = shutil.which('ollama')
+    if not ollama_path:
+        print("[OLLAMA] Command not found; OCR will require Ollama to be started manually.", flush=True)
+        return
+
+    log_path = Path(tempfile.gettempdir()) / 'kokoro_ollama.log'
+    log_file = open(log_path, 'ab')
+    popen_kwargs = {
+        'stdout': log_file,
+        'stderr': subprocess.STDOUT,
+    }
+    if os.name == 'nt':
+        popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    else:
+        popen_kwargs['start_new_session'] = True
+
+    print(f"[OLLAMA] Starting: {ollama_path} serve", flush=True)
+    try:
+        process = subprocess.Popen([ollama_path, 'serve'], **popen_kwargs)
+    except OSError as e:
+        log_file.close()
+        print(f"[OLLAMA] Failed to start Ollama: {e}", flush=True)
+        return
+
+    deadline = time.time() + OLLAMA_STARTUP_TIMEOUT
+    while time.time() < deadline:
+        if process.poll() is not None:
+            print(f"[OLLAMA] Ollama exited early with code {process.returncode}; see {log_path}", flush=True)
+            log_file.close()
+            return
+        if any(_ollama_is_running(api_base) for api_base in api_bases):
+            print(f"[OLLAMA] Ready at one of: {', '.join(api_bases)}", flush=True)
+            log_file.close()
+            return
+        time.sleep(0.5)
+
+    print(f"[OLLAMA] Started but did not respond within {OLLAMA_STARTUP_TIMEOUT:.0f}s; see {log_path}", flush=True)
+    log_file.close()
+
 
 def ocr_image(image_bytes: bytes, constraints: str = '') -> str:
     """Run vision OCR on a screenshot using the Ollama native API, with retries."""
@@ -122,33 +241,35 @@ def ocr_image(image_bytes: bytes, constraints: str = '') -> str:
         "keep_alive": 0
     }).encode('utf-8')
 
-    url = f"{VISION_API_BASE}/api/chat"
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={'Content-Type': 'application/json'}
-    )
+    api_bases = get_vision_api_bases()
 
-    print(f"[OCR] Sending {len(image_bytes)} bytes to {VISION_MODEL}...", flush=True)
+    print(f"[OCR] Sending {len(image_bytes)} bytes to {VISION_MODEL} via {api_bases[0]}...", flush=True)
 
     last_err = None
     for attempt in range(1, OCR_MAX_RETRIES + 1):
-        t0 = time.time()
-        try:
-            with urllib.request.urlopen(req, timeout=OCR_TIMEOUT) as resp:
-                result = json.loads(resp.read().decode('utf-8'))
+        for api_base in api_bases:
+            url = f"{api_base}/api/chat"
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={'Content-Type': 'application/json'}
+            )
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=OCR_TIMEOUT) as resp:
+                    result = json.loads(resp.read().decode('utf-8'))
 
-            text = result.get('message', {}).get('content', '').strip()
-            elapsed = time.time() - t0
-            print(f"[OCR] Got {len(text)} chars in {elapsed:.1f}s (attempt {attempt})", flush=True)
-            return text
+                text = result.get('message', {}).get('content', '').strip()
+                elapsed = time.time() - t0
+                print(f"[OCR] Got {len(text)} chars in {elapsed:.1f}s from {api_base} (attempt {attempt})", flush=True)
+                return text
 
-        except (TimeoutError, urllib.error.URLError, OSError) as e:
-            elapsed = time.time() - t0
-            last_err = e
-            print(f"[OCR] Attempt {attempt}/{OCR_MAX_RETRIES} failed after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
-            if attempt < OCR_MAX_RETRIES:
-                time.sleep(1)  # brief pause before retry
+            except (TimeoutError, urllib.error.URLError, OSError) as e:
+                elapsed = time.time() - t0
+                last_err = e
+                print(f"[OCR] Attempt {attempt}/{OCR_MAX_RETRIES} failed for {api_base} after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+        if attempt < OCR_MAX_RETRIES:
+            time.sleep(1)  # brief pause before retry
 
     raise RuntimeError(f"OCR failed after {OCR_MAX_RETRIES} attempts: {last_err}")
 
@@ -328,6 +449,7 @@ def main():
     args = parser.parse_args()
 
     print(f"[SERVER] Starting on {args.host}:{args.port}", flush=True)
+    ensure_ollama_running()
     get_pipeline()  # pre-load model
 
     # Allow large payloads (screenshots can be ~5MB base64)
