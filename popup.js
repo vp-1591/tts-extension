@@ -1,6 +1,8 @@
 const SERVER = 'http://127.0.0.1:5912';
 let audioCtx = null;
 let currentSource = null;
+let currentSources = [];
+let currentAbortController = null;
 let playing = false;
 
 const btnRead = document.getElementById('btn-read');
@@ -53,11 +55,12 @@ btnRead.addEventListener('click', async () => {
 
   // 3. Send to server: screenshot -> OCR -> TTS
   try {
-    const t0 = Date.now();
+    currentAbortController = new AbortController();
     const r = await fetch(`${SERVER}/ocr_tts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ image: base64, voice: voiceSelect.value }),
+      signal: currentAbortController.signal,
     });
 
     if (!r.ok) {
@@ -65,53 +68,96 @@ btnRead.addEventListener('click', async () => {
       throw new Error(errText || `Server error ${r.status}`);
     }
 
-    btnRead.textContent = '⏳ Decoding audio...';
-
-    const result = await r.json();
-    const ocrText = result.text || '';
-    const audioB64 = result.audio || '';
-
-    // Show OCR text
-    if (ocrText) {
-      ocrTextEl.textContent = ocrText.length > 1500
-        ? ocrText.slice(0, 1500) + '...'
-        : ocrText;
-      ocrTextEl.style.display = 'block';
-    }
-
-    // Decode base64 WAV to ArrayBuffer
-    const audioBuf = base64ToArrayBuffer(audioB64);
-
-    // Play audio
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const decoded = await audioCtx.decodeAudioData(audioBuf);
-    const source = audioCtx.createBufferSource();
-    source.buffer = decoded;
-    source.connect(audioCtx.destination);
-    currentSource = source;
-
-    const duration = decoded.duration;
-    const elapsed = (Date.now() - t0) / 1000;
-    btnRead.textContent = `⏹ Stop (${Math.round(duration)}s)`;
-    btnRead.classList.add('playing');
-    btnRead.disabled = false;
-    playing = true;
-
-    source.onended = () => {
-      playing = false;
-      resetButton();
-      if (audioCtx) { audioCtx.close().catch(() => {}); }
-      audioCtx = null;
-      currentSource = null;
-    };
-
-    source.start(0);
+    btnRead.textContent = '⏳ Waiting for audio...';
+    await playStreamingResponse(r, 1500);
 
   } catch (e) {
+    if (e.name === 'AbortError') return;
     showError(e.message);
     stop();
   }
 });
+
+async function playStreamingResponse(response, textLimit) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let ocrText = '';
+  let nextStart = 0;
+  let activeSources = 0;
+  let streamDone = false;
+  let totalDuration = 0;
+
+  async function handleEvent(event) {
+    if (event.type === 'error') {
+      throw new Error(event.error || 'Streaming OCR/TTS failed');
+    }
+    if (event.type === 'text') {
+      ocrText += event.text;
+      ocrTextEl.textContent = ocrText.length > textLimit
+        ? ocrText.slice(0, textLimit) + '...'
+        : ocrText;
+      ocrTextEl.style.display = 'block';
+      return;
+    }
+    if (event.type === 'audio') {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        btnRead.classList.add('playing');
+        btnRead.disabled = false;
+        playing = true;
+      }
+
+      const decoded = await audioCtx.decodeAudioData(base64ToArrayBuffer(event.audio));
+      const source = audioCtx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(audioCtx.destination);
+      currentSource = source;
+      currentSources.push(source);
+
+      const startAt = Math.max(audioCtx.currentTime, nextStart);
+      nextStart = startAt + decoded.duration;
+      totalDuration += decoded.duration;
+      activeSources += 1;
+      btnRead.textContent = `⏹ Stop (${Math.round(totalDuration)}s)`;
+
+      source.onended = () => {
+        activeSources -= 1;
+        currentSources = currentSources.filter((s) => s !== source);
+        if (streamDone && activeSources === 0) {
+          stop();
+        }
+      };
+
+      source.start(startAt);
+      return;
+    }
+    if (event.type === 'done') {
+      streamDone = true;
+      if (activeSources === 0) {
+        stop();
+      }
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, { stream: true });
+    const lines = pending.split('\n');
+    pending = lines.pop();
+    for (const line of lines) {
+      if (line.trim()) {
+        await handleEvent(JSON.parse(line));
+      }
+    }
+  }
+
+  pending += decoder.decode();
+  if (pending.trim()) {
+    await handleEvent(JSON.parse(pending));
+  }
+}
 
 function base64ToArrayBuffer(base64) {
   const binary = atob(base64);
@@ -124,6 +170,10 @@ function base64ToArrayBuffer(base64) {
 
 function stop() {
   if (currentSource) { try { currentSource.stop(); } catch {} }
+  for (const source of currentSources) { try { source.stop(); } catch {} }
+  currentSources = [];
+  if (currentAbortController) { currentAbortController.abort(); }
+  currentAbortController = null;
   if (audioCtx) { audioCtx.close().catch(() => {}); }
   audioCtx = null;
   currentSource = null;

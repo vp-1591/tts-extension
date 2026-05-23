@@ -4,7 +4,7 @@
   "description": "Screenshot → OCR → Read aloud. Reads scanned PDFs and images that Narrator can't.",
   "version": "2.0",
   "permissions": ["activeTab", "sidePanel"],
-  "host_permissions": ["http://127.0.0.1:5912/*"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:5912/*"],
   "action": {
     "default_title": "TTS Screen Reader",
     "default_icon": {

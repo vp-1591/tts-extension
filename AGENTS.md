@@ -1,7 +1,9 @@
 ## Rules
 
-Commit messages must include a bullet list with detailed changes in the commit body.
+Run project tests from WSL because the Kokoro server and its runtime dependencies work from WSL.
 
-When running long commands, wrap them in an appropriate timeout, e.g. `timeout 300 python test.py`.
+Kokoro server works from WSL. Launch `kokoro_server` via WSL with:
 
-Kokoro server works from WSL.
+```bash
+python3 ~/hermes-workdir/tts-extension/kokoro_server.py
+```
