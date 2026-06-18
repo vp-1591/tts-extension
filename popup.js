@@ -34,6 +34,7 @@ async function updateConvIndicator() {
     const turns = d.turn_count || 0;
     const shortId = d.conversation_id.split('_').slice(-2).join('_');
     convIndicator.textContent = turns > 0 ? `${shortId} (${turns})` : shortId;
+    localStorage.setItem('tts-conversation-id', d.conversation_id);
   } catch {
     convIndicator.textContent = '';
   }

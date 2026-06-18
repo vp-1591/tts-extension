@@ -12,6 +12,7 @@ import base64
 import ipaddress
 import io
 import json
+import logging
 import os
 import shutil
 import sys
@@ -30,6 +31,20 @@ from kokoro import KPipeline
 
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
+
+# --- Logging ---
+LOGS_DIR = Path(__file__).parent / 'logs'
+
+def setup_logging():
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / 'server.log'
+    handler = logging.FileHandler(log_file, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.root.addHandler(handler)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.root.addHandler(stream_handler)
+    logging.root.setLevel(logging.INFO)
 
 # --- Conversation storage ---
 CONVERSATIONS_DIR = Path(__file__).parent / 'conversations'
@@ -123,13 +138,13 @@ def get_pipeline():
         if pipeline is None:
             for device in ('cuda', 'cpu'):
                 try:
-                    print(f"[SERVER] Loading Kokoro model on {device}...", flush=True)
+                    logging.info(f"[SERVER] Loading Kokoro model on {device}...")
                     pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device=device)
-                    print(f"[SERVER] Kokoro model loaded on {device}.", flush=True)
+                    logging.info(f"[SERVER] Kokoro model loaded on {device}.")
                     return pipeline
                 except Exception as e:
                     if device == 'cuda':
-                        print(f"[SERVER] CUDA failed ({e}); falling back to CPU...", flush=True)
+                        logging.warning(f"[SERVER] CUDA failed ({e}); falling back to CPU...")
                         try:
                             import torch
                             torch.cuda.empty_cache()
@@ -145,14 +160,14 @@ def reset_pipeline():
     global pipeline
     with pipeline_lock:
         if pipeline is not None:
-            print("[SERVER] Resetting Kokoro pipeline due to CUDA error...", flush=True)
+            logging.warning("[SERVER] Resetting Kokoro pipeline due to CUDA error...")
             try:
                 import torch
                 torch.cuda.empty_cache()
             except Exception:
                 pass
             pipeline = None
-            print("[SERVER] Pipeline reset. Will reload on next request.", flush=True)
+            logging.info("[SERVER] Pipeline reset. Will reload on next request.")
 
 
 def is_cuda_error(exc: BaseException) -> bool:
@@ -249,12 +264,12 @@ def ensure_ollama_running() -> None:
     """Start a local Ollama server if the configured API routes are offline."""
     api_bases = get_vision_api_bases()
     if any(_ollama_is_running(api_base) for api_base in api_bases):
-        print(f"[OLLAMA] Already running at one of: {', '.join(api_bases)}", flush=True)
+        logging.info(f"[OLLAMA] Already running at one of: {', '.join(api_bases)}")
         return
 
     ollama_path = shutil.which('ollama')
     if not ollama_path:
-        print("[OLLAMA] Command not found; OCR will require Ollama to be started manually.", flush=True)
+        logging.warning("[OLLAMA] Command not found; OCR will require Ollama to be started manually.")
         return
 
     log_path = Path(tempfile.gettempdir()) / 'kokoro_ollama.log'
@@ -268,27 +283,27 @@ def ensure_ollama_running() -> None:
     else:
         popen_kwargs['start_new_session'] = True
 
-    print(f"[OLLAMA] Starting: {ollama_path} serve", flush=True)
+    logging.info(f"[OLLAMA] Starting: {ollama_path} serve")
     try:
         process = subprocess.Popen([ollama_path, 'serve'], **popen_kwargs)
     except OSError as e:
         log_file.close()
-        print(f"[OLLAMA] Failed to start Ollama: {e}", flush=True)
+        logging.error(f"[OLLAMA] Failed to start Ollama: {e}")
         return
 
     deadline = time.time() + OLLAMA_STARTUP_TIMEOUT
     while time.time() < deadline:
         if process.poll() is not None:
-            print(f"[OLLAMA] Ollama exited early with code {process.returncode}; see {log_path}", flush=True)
+            logging.error(f"[OLLAMA] Ollama exited early with code {process.returncode}; see {log_path}")
             log_file.close()
             return
         if any(_ollama_is_running(api_base) for api_base in api_bases):
-            print(f"[OLLAMA] Ready at one of: {', '.join(api_bases)}", flush=True)
+            logging.info(f"[OLLAMA] Ready at one of: {', '.join(api_bases)}")
             log_file.close()
             return
         time.sleep(0.5)
 
-    print(f"[OLLAMA] Started but did not respond within {OLLAMA_STARTUP_TIMEOUT:.0f}s; see {log_path}", flush=True)
+    logging.warning(f"[OLLAMA] Started but did not respond within {OLLAMA_STARTUP_TIMEOUT:.0f}s; see {log_path}")
     log_file.close()
 
 
@@ -334,7 +349,7 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
     }).encode('utf-8')
 
     api_bases = get_vision_api_bases()
-    print(f"[OCR] Streaming {len(image_bytes)} bytes to {VISION_MODEL} via {api_bases[0]}...", flush=True)
+    logging.info(f"[OCR] Streaming {len(image_bytes)} bytes to {VISION_MODEL} via {api_bases[0]}...")
 
     last_err = None
     for attempt in range(1, OCR_MAX_RETRIES + 1):
@@ -347,6 +362,7 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
             )
             t0 = time.time()
             chars = 0
+            ttft_logged = False
             try:
                 with urllib.request.urlopen(req, timeout=OCR_TIMEOUT) as resp:
                     for raw_line in resp:
@@ -357,21 +373,26 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
                             raise RuntimeError(event['error'])
                         fragment = event.get('message', {}).get('content', '')
                         if fragment:
+                            if not ttft_logged:
+                                ttft_ms = (time.time() - t0) * 1000
+                                logging.info(f"[OCR] TTFT: {ttft_ms:.0f}ms")
+                                ttft_logged = True
                             chars += len(fragment)
                             yield fragment
                         if event.get('done'):
                             elapsed = time.time() - t0
-                            print(f"[OCR] Streamed {chars} chars in {elapsed:.1f}s from {api_base} (attempt {attempt})", flush=True)
+                            tps = chars / elapsed if elapsed > 0 else 0
+                            logging.info(f"[OCR] Streamed {chars} chars in {elapsed:.1f}s from {api_base} (attempt {attempt}), TPS: {tps:.1f} chars/s")
                             return
 
             except (TimeoutError, urllib.error.URLError, OSError) as e:
                 elapsed = time.time() - t0
                 last_err = e
-                print(f"[OCR] Attempt {attempt}/{OCR_MAX_RETRIES} failed for {api_base} after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+                logging.warning(f"[OCR] Attempt {attempt}/{OCR_MAX_RETRIES} failed for {api_base} after {elapsed:.1f}s: {type(e).__name__}: {e}")
             except Exception as e:
                 elapsed = time.time() - t0
                 last_err = e
-                print(f"[OCR] Stream failed for {api_base} after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+                logging.error(f"[OCR] Stream failed for {api_base} after {elapsed:.1f}s: {type(e).__name__}: {e}")
         if attempt < OCR_MAX_RETRIES:
             time.sleep(1)
 
@@ -417,7 +438,7 @@ def text_to_wav(text: str, voice: str = DEFAULT_VOICE, _retry: bool = True) -> b
         return buf.getvalue()
     except Exception as e:
         if _retry and is_cuda_error(e):
-            print(f"[TTS] CUDA error, resetting pipeline and retrying: {e}", flush=True)
+            logging.warning(f"[TTS] CUDA error, resetting pipeline and retrying: {e}")
             reset_pipeline()
             return text_to_wav(text, voice=voice, _retry=False)
         raise
@@ -441,6 +462,10 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self.path == '/new_conversation':
+            self.handle_new_conversation()
+            return
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
 
@@ -454,8 +479,6 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.handle_tts(data)
         elif self.path == '/ocr_tts':
             self.handle_ocr_tts(data)
-        elif self.path == '/new_conversation':
-            self.handle_new_conversation()
         else:
             self.send_error(404)
 
@@ -473,10 +496,11 @@ class TTSHandler(BaseHTTPRequestHandler):
             wav_bytes = text_to_wav(text, voice)
             elapsed = time.time() - t0
             duration = len(wav_bytes) / (SAMPLE_RATE * 2)  # rough estimate
-            print(f"[TTS] {elapsed:.1f}s for {len(text)} chars", flush=True)
+            tps = len(text) / elapsed if elapsed > 0 else 0
+            logging.info(f"[TTS] {elapsed:.1f}s for {len(text)} chars, TPS: {tps:.1f} chars/s")
             self.send_wav(wav_bytes)
         except Exception as e:
-            print(f"[TTS ERROR] {e}", flush=True)
+            logging.error(f"[TTS ERROR] {e}")
             self.send_error(500, str(e))
 
     def handle_ocr_tts(self, data):
@@ -492,12 +516,17 @@ class TTSHandler(BaseHTTPRequestHandler):
 
         try:
             image_bytes = base64.b64decode(image_b64)
-            print(f"[OCR_TTS] Received {len(image_bytes)} byte image", flush=True)
+            logging.info(f"[OCR_TTS] Received {len(image_bytes)} byte image")
             if constraints:
-                print(f"[OCR_TTS] Constraints: {constraints[:200]}", flush=True)
+                logging.info(f"[OCR_TTS] Constraints: {constraints[:200]}")
 
             # Build user prompt text for history
             user_prompt = constraints if constraints else "Transcribe all readable text from this image verbatim. Do not add any description or commentary."
+
+            # Auto-assign conversation when history is enabled but no ID provided
+            if history_enabled and not conversation_id:
+                conversation_id = ensure_conversation_dir()
+                logging.info(f"[OCR_TTS] Auto-assigned conversation: {conversation_id}")
 
             # Load history turns if enabled
             history_turns = None
@@ -534,9 +563,9 @@ class TTSHandler(BaseHTTPRequestHandler):
                         audio_chunks += 1
                         audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
                         self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
-                        print(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s", flush=True)
+                        logging.info(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s")
                     except Exception as tts_err:
-                        print(f"[OCR_TTS] TTS chunk failed: {tts_err}", flush=True)
+                        logging.warning(f"[OCR_TTS] TTS chunk failed: {tts_err}")
                         if is_cuda_error(tts_err):
                             self.send_stream_event({'type': 'error', 'error': f'GPU error during audio generation: {tts_err}. Try again.'})
                             return
@@ -552,9 +581,9 @@ class TTSHandler(BaseHTTPRequestHandler):
                     audio_chunks += 1
                     audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
                     self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
-                    print(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s", flush=True)
+                    logging.info(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s")
                 except Exception as tts_err:
-                    print(f"[OCR_TTS] Final TTS chunk failed: {tts_err}", flush=True)
+                    logging.warning(f"[OCR_TTS] Final TTS chunk failed: {tts_err}")
                     if is_cuda_error(tts_err):
                         self.send_stream_event({'type': 'error', 'error': f'GPU error during audio generation: {tts_err}. Try again.'})
                         return
@@ -569,19 +598,17 @@ class TTSHandler(BaseHTTPRequestHandler):
                 try:
                     save_turn(conversation_id, image_bytes, user_prompt, text)
                 except Exception as e:
-                    print(f"[OCR_TTS] Warning: failed to save turn: {e}", flush=True)
+                    logging.warning(f"[OCR_TTS] Warning: failed to save turn: {e}")
 
             total = time.time() - t0
-            print(f"[OCR_TTS] Total: {total:.1f}s, {len(text)} chars, {audio_chunks} audio chunks", flush=True)
+            logging.info(f"[OCR_TTS] Total: {total:.1f}s, {len(text)} chars, {audio_chunks} audio chunks")
             done_event = {'type': 'done', 'text': text}
             if history_enabled and conversation_id:
                 done_event['conversation_id'] = conversation_id
             self.send_stream_event(done_event)
 
         except Exception as e:
-            print(f"[OCR_TTS ERROR] {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            logging.error(f"[OCR_TTS ERROR] {e}", exc_info=True)
             if getattr(self, 'streaming_response_started', False):
                 self.send_stream_event({'type': 'error', 'error': str(e)})
             else:
@@ -646,26 +673,27 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     args = parser.parse_args()
 
-    print(f"[SERVER] Starting on {args.host}:{args.port}", flush=True)
+    setup_logging()
+    logging.info(f"[SERVER] Starting on {args.host}:{args.port}")
     ensure_ollama_running()
     ensure_conversation_dir()
     try:
         get_pipeline()  # pre-load model
     except Exception as e:
-        print(f"[SERVER] Warning: pre-load failed ({e}); model will load on first request.", flush=True)
+        logging.warning(f"[SERVER] Pre-load failed ({e}); model will load on first request.")
 
     # Allow large payloads (screenshots can be ~5MB base64)
     # Override both server and handler limits
     import http.server
     http.server.BaseHTTPRequestHandler.max_request_line = 10 * 1024 * 1024  # 10MB
-    
+
     server = HTTPServer((args.host, args.port), TTSHandler)
     server.allow_reuse_address = True
-    print(f"[SERVER] Ready at http://{args.host}:{args.port}", flush=True)
+    logging.info(f"[SERVER] Ready at http://{args.host}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down.", flush=True)
+        logging.info("[SERVER] Shutting down.")
         server.server_close()
 
 
