@@ -31,6 +31,11 @@ from kokoro import KPipeline
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
 
+# --- Conversation storage ---
+CONVERSATIONS_DIR = Path(__file__).parent / 'conversations'
+CURRENT_PTR = CONVERSATIONS_DIR / 'current.txt'
+conv_lock = threading.Lock()
+
 # --- Globals ---
 pipeline = None
 pipeline_lock = threading.Lock()
@@ -41,6 +46,75 @@ OLLAMA_STARTUP_TIMEOUT = float(os.environ.get('OLLAMA_STARTUP_TIMEOUT', '15'))
 
 OCR_SYSTEM_PROMPT_PLAIN = """Transcribe all readable text from this screenshot. Output ONLY the transcribed text, nothing else. Do not describe the image."""
 OCR_SYSTEM_PROMPT_CONSTRAINED = """You are an OCR assistant. Read the text in the image and follow the user's instructions exactly. Do not describe the image."""
+
+
+def new_conversation() -> str:
+    """Create a new conversation, set it as current, and return its ID."""
+    from datetime import datetime
+    conv_id = datetime.now().strftime('conv_%Y%m%d_%H%M%S')
+    conv_dir = CONVERSATIONS_DIR / conv_id
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    (conv_dir / 'images').mkdir(exist_ok=True)
+    conv_data = {
+        'id': conv_id,
+        'created': datetime.now().isoformat(),
+        'turns': []
+    }
+    (conv_dir / 'conv.json').write_text(json.dumps(conv_data, indent=2), encoding='utf-8')
+    with conv_lock:
+        CURRENT_PTR.write_text(conv_id, encoding='utf-8')
+    return conv_id
+
+
+def ensure_conversation_dir() -> str:
+    """Ensure conversations directory and current pointer exist; return current conversation_id."""
+    CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    conv_id = None
+    if CURRENT_PTR.exists():
+        candidate = CURRENT_PTR.read_text().strip()
+        conv_dir = CONVERSATIONS_DIR / candidate
+        if conv_dir.is_dir() and (conv_dir / 'conv.json').exists():
+            conv_id = candidate
+    if conv_id is None:
+        conv_id = new_conversation()
+    return conv_id
+
+
+def load_conversation(conv_id: str) -> dict:
+    """Load conversation JSON from disk."""
+    conv_path = CONVERSATIONS_DIR / conv_id / 'conv.json'
+    return json.loads(conv_path.read_text(encoding='utf-8'))
+
+
+def save_conversation(conv_id: str, data: dict) -> None:
+    """Write conversation JSON to disk."""
+    conv_path = CONVERSATIONS_DIR / conv_id / 'conv.json'
+    conv_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+
+def save_turn(conv_id: str, image_bytes: bytes, prompt: str, ocr_text: str) -> None:
+    """Append a turn to the conversation and save the image to disk."""
+    with conv_lock:
+        conv_data = load_conversation(conv_id)
+        turn_num = len(conv_data['turns']) // 2 + 1
+        image_filename = f'{turn_num:03d}.png'
+        image_dir = CONVERSATIONS_DIR / conv_id / 'images'
+        image_dir.mkdir(exist_ok=True)
+        image_path = image_dir / image_filename
+        image_path.write_bytes(image_bytes)
+
+        relative_image_path = f'{conv_id}/images/{image_filename}'
+
+        conv_data['turns'].append({
+            'role': 'user',
+            'image_path': relative_image_path,
+            'prompt': prompt
+        })
+        conv_data['turns'].append({
+            'role': 'assistant',
+            'text': ocr_text
+        })
+        save_conversation(conv_id, conv_data)
 
 
 def get_pipeline():
@@ -172,7 +246,7 @@ def ensure_ollama_running() -> None:
     log_file.close()
 
 
-def ocr_image_stream(image_bytes: bytes, constraints: str = ''):
+def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: list | None = None):
     """Yield OCR text fragments from the Ollama native streaming API."""
     import urllib.request
     import urllib.error
@@ -184,12 +258,30 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = ''):
         user_text = constraints
     system_prompt = OCR_SYSTEM_PROMPT_CONSTRAINED if constraints else OCR_SYSTEM_PROMPT_PLAIN
 
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if history_turns:
+        for turn in history_turns:
+            if turn['role'] == 'user':
+                img_path = CONVERSATIONS_DIR / turn['image_path']
+                img_b64 = base64.b64encode(img_path.read_bytes()).decode('utf-8')
+                messages.append({
+                    "role": "user",
+                    "content": turn['prompt'],
+                    "images": [img_b64]
+                })
+            elif turn['role'] == 'assistant':
+                messages.append({"role": "assistant", "content": turn['text']})
+
+    messages.append({
+        "role": "user",
+        "content": f"{user_text}\n\n[image attached]",
+        "images": [b64]
+    })
+
     payload = json.dumps({
         "model": VISION_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{user_text}\n\n[image attached]", "images": [b64]}
-        ],
+        "messages": messages,
         "think": False,
         "stream": True,
         "keep_alive": 0
@@ -290,6 +382,8 @@ class TTSHandler(BaseHTTPRequestHandler):
                 'bf_emma', 'bf_isabella',
                 'bm_george', 'bm_lewis',
             ]})
+        elif self.path == '/conversation_state':
+            self.handle_conversation_state()
         else:
             self.send_error(404)
 
@@ -307,6 +401,8 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.handle_tts(data)
         elif self.path == '/ocr_tts':
             self.handle_ocr_tts(data)
+        elif self.path == '/new_conversation':
+            self.handle_new_conversation()
         else:
             self.send_error(404)
 
@@ -335,6 +431,8 @@ class TTSHandler(BaseHTTPRequestHandler):
         image_b64 = data.get('image', '')
         voice = data.get('voice', DEFAULT_VOICE)
         constraints = data.get('constraints', '').strip()
+        history_enabled = data.get('history', False)
+        conversation_id = data.get('conversation_id', '')
         if not image_b64:
             self.send_error(400, 'No image provided')
             return
@@ -344,6 +442,18 @@ class TTSHandler(BaseHTTPRequestHandler):
             print(f"[OCR_TTS] Received {len(image_bytes)} byte image", flush=True)
             if constraints:
                 print(f"[OCR_TTS] Constraints: {constraints[:200]}", flush=True)
+
+            # Build user prompt text for history
+            user_prompt = constraints if constraints else "Transcribe all readable text from this image verbatim. Do not add any description or commentary."
+
+            # Load history turns if enabled
+            history_turns = None
+            if history_enabled and conversation_id:
+                try:
+                    conv_data = load_conversation(conversation_id)
+                    history_turns = conv_data.get('turns', [])
+                except (FileNotFoundError, json.JSONDecodeError):
+                    history_turns = None
 
             t0 = time.time()
             self.send_response(200)
@@ -357,7 +467,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             full_text = []
             audio_chunks = 0
 
-            for fragment in ocr_image_stream(image_bytes, constraints=constraints):
+            for fragment in ocr_image_stream(image_bytes, constraints=constraints, history_turns=history_turns):
                 full_text.append(fragment)
                 buffer += fragment
                 while True:
@@ -387,9 +497,19 @@ class TTSHandler(BaseHTTPRequestHandler):
                 self.send_stream_event({'type': 'error', 'error': 'No text found in image'})
                 return
 
+            # Save turn to conversation history if enabled
+            if history_enabled and conversation_id:
+                try:
+                    save_turn(conversation_id, image_bytes, user_prompt, text)
+                except Exception as e:
+                    print(f"[OCR_TTS] Warning: failed to save turn: {e}", flush=True)
+
             total = time.time() - t0
             print(f"[OCR_TTS] Total: {total:.1f}s, {len(text)} chars, {audio_chunks} audio chunks", flush=True)
-            self.send_stream_event({'type': 'done', 'text': text})
+            done_event = {'type': 'done', 'text': text}
+            if history_enabled and conversation_id:
+                done_event['conversation_id'] = conversation_id
+            self.send_stream_event(done_event)
 
         except Exception as e:
             print(f"[OCR_TTS ERROR] {e}", flush=True)
@@ -399,6 +519,26 @@ class TTSHandler(BaseHTTPRequestHandler):
                 self.send_stream_event({'type': 'error', 'error': str(e)})
             else:
                 self.send_error(500, str(e))
+
+    def handle_conversation_state(self):
+        """Return current conversation ID and turn count."""
+        try:
+            conv_id = ensure_conversation_dir()
+            conv_data = load_conversation(conv_id)
+            self.send_json({
+                'conversation_id': conv_id,
+                'turn_count': len(conv_data['turns']) // 2
+            })
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def handle_new_conversation(self):
+        """Create a new conversation and set it as current."""
+        try:
+            conv_id = new_conversation()
+            self.send_json({'conversation_id': conv_id})
+        except Exception as e:
+            self.send_error(500, str(e))
 
     def send_stream_event(self, obj):
         body = (json.dumps(obj) + '\n').encode('utf-8')
@@ -441,6 +581,7 @@ def main():
 
     print(f"[SERVER] Starting on {args.host}:{args.port}", flush=True)
     ensure_ollama_running()
+    ensure_conversation_dir()
     get_pipeline()  # pre-load model
 
     # Allow large payloads (screenshots can be ~5MB base64)

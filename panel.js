@@ -11,6 +11,9 @@ const voiceSelect = document.getElementById('voice');
 const constraintsEl = document.getElementById('constraints');
 const ocrTextEl = document.getElementById('ocr-text');
 const errorEl = document.getElementById('error');
+const historyToggle = document.getElementById('history-toggle');
+const btnNewConv = document.getElementById('btn-new-conv');
+const convIndicator = document.getElementById('conv-indicator');
 
 // Restore saved preferences
 const savedVoice = localStorage.getItem('tts-voice');
@@ -23,6 +26,36 @@ const savedConstraints = localStorage.getItem('tts-constraints');
 if (savedConstraints) constraintsEl.value = savedConstraints;
 constraintsEl.addEventListener('input', () => {
   localStorage.setItem('tts-constraints', constraintsEl.value);
+});
+
+// History toggle state
+const savedHistory = localStorage.getItem('tts-history-enabled');
+if (savedHistory === 'true') historyToggle.checked = true;
+historyToggle.addEventListener('change', () => {
+  localStorage.setItem('tts-history-enabled', historyToggle.checked);
+});
+
+async function updateConvIndicator() {
+  try {
+    const r = await fetch(`${SERVER}/conversation_state`);
+    const d = await r.json();
+    const turns = d.turn_count || 0;
+    const shortId = d.conversation_id.split('_').slice(-2).join('_');
+    convIndicator.textContent = turns > 0 ? `${shortId} (${turns})` : shortId;
+  } catch {
+    convIndicator.textContent = '';
+  }
+}
+
+btnNewConv.addEventListener('click', async () => {
+  try {
+    const r = await fetch(`${SERVER}/new_conversation`, { method: 'POST' });
+    const d = await r.json();
+    localStorage.setItem('tts-conversation-id', d.conversation_id);
+    await updateConvIndicator();
+  } catch {
+    // silently fail
+  }
 });
 
 async function checkHealth() {
@@ -68,6 +101,13 @@ btnRead.addEventListener('click', async () => {
     const constraints = constraintsEl.value.trim();
     if (constraints) {
       payload.constraints = constraints;
+    }
+    if (historyToggle.checked) {
+      payload.history = true;
+      const convId = localStorage.getItem('tts-conversation-id');
+      if (convId) {
+        payload.conversation_id = convId;
+      }
     }
 
     currentAbortController = new AbortController();
@@ -148,6 +188,12 @@ async function playStreamingResponse(response, textLimit) {
       return;
     }
     if (event.type === 'done') {
+      if (event.conversation_id) {
+        localStorage.setItem('tts-conversation-id', event.conversation_id);
+      }
+      if (historyToggle.checked) {
+        updateConvIndicator();
+      }
       streamDone = true;
       if (activeSources === 0) {
         stop();
@@ -208,3 +254,4 @@ function showError(msg) {
 }
 
 checkHealth();
+updateConvIndicator();

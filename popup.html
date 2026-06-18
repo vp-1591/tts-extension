@@ -98,6 +98,84 @@
       margin-top: 8px;
       text-align: center;
     }
+    .history-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      padding: 4px 0;
+    }
+    .toggle-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #8892b0;
+      flex: 1;
+    }
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #333;
+      border-radius: 20px;
+      transition: 0.2s;
+    }
+    .toggle-slider::before {
+      content: '';
+      position: absolute;
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background: #888;
+      border-radius: 50%;
+      transition: 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-slider {
+      background: #1a4a8a;
+    }
+    .toggle-switch input:checked + .toggle-slider::before {
+      transform: translateX(16px);
+      background: #64ffda;
+    }
+    .btn-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 1px solid #333;
+      background: #16213e;
+      color: #64ffda;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      line-height: 1;
+      transition: all 0.15s;
+    }
+    .btn-icon:hover {
+      filter: brightness(1.2);
+      border-color: #1a4a8a;
+    }
+    .conv-indicator {
+      font-size: 10px;
+      color: #445;
+      white-space: nowrap;
+    }
   </style>
 </head>
 <body>
@@ -119,6 +197,17 @@
       <option value="bm_george">George (UK &#9794;)</option>
       <option value="bm_lewis">Lewis (UK &#9794;)</option>
     </select>
+  </div>
+  <div class="history-row">
+    <label class="toggle-label">
+      <span>History</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="history-toggle">
+        <span class="toggle-slider"></span>
+      </label>
+    </label>
+    <button id="btn-new-conv" class="btn-icon" title="New conversation">+</button>
+    <span id="conv-indicator" class="conv-indicator"></span>
   </div>
   <div class="ocr-text" id="ocr-text"></div>
   <div class="error-msg" id="error"></div>
