@@ -121,10 +121,56 @@ def get_pipeline():
     global pipeline
     with pipeline_lock:
         if pipeline is None:
-            print("[SERVER] Loading Kokoro model...", flush=True)
-            pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device='cuda')
-            print("[SERVER] Kokoro model loaded.", flush=True)
+            for device in ('cuda', 'cpu'):
+                try:
+                    print(f"[SERVER] Loading Kokoro model on {device}...", flush=True)
+                    pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device=device)
+                    print(f"[SERVER] Kokoro model loaded on {device}.", flush=True)
+                    return pipeline
+                except Exception as e:
+                    if device == 'cuda':
+                        print(f"[SERVER] CUDA failed ({e}); falling back to CPU...", flush=True)
+                        try:
+                            import torch
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    else:
+                        raise
         return pipeline
+
+
+def reset_pipeline():
+    """Reset the Kokoro pipeline, clearing GPU memory. Next call to get_pipeline() will reload."""
+    global pipeline
+    with pipeline_lock:
+        if pipeline is not None:
+            print("[SERVER] Resetting Kokoro pipeline due to CUDA error...", flush=True)
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            pipeline = None
+            print("[SERVER] Pipeline reset. Will reload on next request.", flush=True)
+
+
+def is_cuda_error(exc: BaseException) -> bool:
+    """Check if an exception is CUDA-related (driver crash, OOM, device error)."""
+    exc_name = type(exc).__name__
+    msg = str(exc).lower()
+    if 'cuda' in exc_name.lower() or 'cuda' in msg:
+        return True
+    if 'accelerator' in exc_name.lower():
+        return True
+    # torch exceptions
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except ImportError:
+        pass
+    return False
 
 
 OCR_MAX_RETRIES = 3
@@ -354,20 +400,27 @@ def pop_tts_segment(buffer: str, force: bool = False) -> tuple[str | None, str]:
     return (segment or None), remainder
 
 
-def text_to_wav(text: str, voice: str = DEFAULT_VOICE) -> bytes:
-    """Generate TTS audio and return WAV bytes."""
+def text_to_wav(text: str, voice: str = DEFAULT_VOICE, _retry: bool = True) -> bytes:
+    """Generate TTS audio and return WAV bytes. Retries once on CUDA errors."""
     pipe = get_pipeline()
-    all_audio = []
-    for gs, ps, audio in pipe(text, voice=voice):
-        all_audio.append(audio)
+    try:
+        all_audio = []
+        for gs, ps, audio in pipe(text, voice=voice):
+            all_audio.append(audio)
 
-    if not all_audio:
-        raise RuntimeError("No audio generated")
+        if not all_audio:
+            raise RuntimeError("No audio generated")
 
-    combined = np.concatenate(all_audio)
-    buf = io.BytesIO()
-    sf.write(buf, combined, SAMPLE_RATE, format='WAV')
-    return buf.getvalue()
+        combined = np.concatenate(all_audio)
+        buf = io.BytesIO()
+        sf.write(buf, combined, SAMPLE_RATE, format='WAV')
+        return buf.getvalue()
+    except Exception as e:
+        if _retry and is_cuda_error(e):
+            print(f"[TTS] CUDA error, resetting pipeline and retrying: {e}", flush=True)
+            reset_pipeline()
+            return text_to_wav(text, voice=voice, _retry=False)
+        raise
 
 
 class TTSHandler(BaseHTTPRequestHandler):
@@ -475,22 +528,36 @@ class TTSHandler(BaseHTTPRequestHandler):
                     if not segment:
                         break
                     self.send_stream_event({'type': 'text', 'text': segment})
+                    try:
+                        tts_start = time.time()
+                        wav_bytes = text_to_wav(segment, voice)
+                        audio_chunks += 1
+                        audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
+                        self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
+                        print(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s", flush=True)
+                    except Exception as tts_err:
+                        print(f"[OCR_TTS] TTS chunk failed: {tts_err}", flush=True)
+                        if is_cuda_error(tts_err):
+                            self.send_stream_event({'type': 'error', 'error': f'GPU error during audio generation: {tts_err}. Try again.'})
+                            return
+                        # Non-CUDA TTS errors: skip audio for this chunk but continue OCR
+                        self.send_stream_event({'type': 'text', 'text': f'[Audio generation failed: {tts_err}]'})
+
+            segment, buffer = pop_tts_segment(buffer, force=True)
+            if segment:
+                self.send_stream_event({'type': 'text', 'text': segment})
+                try:
                     tts_start = time.time()
                     wav_bytes = text_to_wav(segment, voice)
                     audio_chunks += 1
                     audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
                     self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
                     print(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s", flush=True)
-
-            segment, buffer = pop_tts_segment(buffer, force=True)
-            if segment:
-                self.send_stream_event({'type': 'text', 'text': segment})
-                tts_start = time.time()
-                wav_bytes = text_to_wav(segment, voice)
-                audio_chunks += 1
-                audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
-                self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
-                print(f"[OCR_TTS] Chunk {audio_chunks}: {len(segment)} chars -> TTS in {time.time() - tts_start:.1f}s", flush=True)
+                except Exception as tts_err:
+                    print(f"[OCR_TTS] Final TTS chunk failed: {tts_err}", flush=True)
+                    if is_cuda_error(tts_err):
+                        self.send_stream_event({'type': 'error', 'error': f'GPU error during audio generation: {tts_err}. Try again.'})
+                        return
 
             text = ''.join(full_text).strip()
             if not text:
@@ -582,7 +649,10 @@ def main():
     print(f"[SERVER] Starting on {args.host}:{args.port}", flush=True)
     ensure_ollama_running()
     ensure_conversation_dir()
-    get_pipeline()  # pre-load model
+    try:
+        get_pipeline()  # pre-load model
+    except Exception as e:
+        print(f"[SERVER] Warning: pre-load failed ({e}); model will load on first request.", flush=True)
 
     # Allow large payloads (screenshots can be ~5MB base64)
     # Override both server and handler limits
