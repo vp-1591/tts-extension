@@ -458,6 +458,7 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
 # of the system prompt, and Kokoro reads markup tokens aloud ("star star").
 # Code content is deliberately untouched — users who need verbatim symbols pass
 # their own constraints; the sanitizer removes formatting, never content.
+# Decision: docs/adr/0003-sanitize-ocr-output-before-tts.md
 _EMOJI_RANGES = (
     (0x1F000, 0x1FAFF),  # emoji and pictographs
     (0x2190, 0x21FF),    # arrows
