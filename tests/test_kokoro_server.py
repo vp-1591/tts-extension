@@ -95,6 +95,65 @@ class KokoroServerTests(unittest.TestCase):
         self.assertTrue(manifest.get('key'))
 
 
+class SanitizeForSpeechTests(unittest.TestCase):
+    def test_strips_paired_stars(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('**Big heading** body'), 'Big heading body')
+
+    def test_strips_headers_bullets_and_rules(self):
+        text = '# Title\n- first\n* second\n---\nPlain tail.'
+        self.assertEqual(kokoro_server.sanitize_for_speech(text), 'Title\nfirst\nsecond\nPlain tail.')
+
+    def test_keeps_numbered_items(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('1. Get milk\n2. Buy eggs'), '1. Get milk\n2. Buy eggs')
+
+    def test_strips_emoji_silently(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('Great! 🎉\nWarning ⚠️ sign'), 'Great!\nWarning sign')
+
+    def test_link_replaced_by_text(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('See [docs](https://example.com/x) now'), 'See docs now')
+
+    def test_code_content_untouched(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('call foo_bar_baz here'), 'call foo_bar_baz here')
+
+    def test_inline_backticks_removed_content_kept(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('run `npm install` first'), 'run npm install first')
+
+    def test_arithmetic_plus_minus_survives(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('2 - 3 items'), '2 - 3 items')
+
+    def test_orphan_markers_trimmed_at_edges(self):
+        self.assertEqual(kokoro_server.sanitize_for_speech('**Heading.'), 'Heading.')
+
+
+class OcrTtsStreamTests(unittest.TestCase):
+    def make_handler(self):
+        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
+        handler.rfile = io.BytesIO(b'')
+        handler.wfile = FlushableBytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+    def test_stream_sanitizes_text_audio_and_done_events(self):
+        handler = self.make_handler()
+        fragments = ['**Big heading**\n', '- first bullet 🎉\n', 'Plain tail.']
+        with patch.object(kokoro_server, 'ocr_image_stream', return_value=iter(fragments)), \
+             patch.object(kokoro_server, 'text_to_wav', return_value=b'RIFF'):
+            kokoro_server.TTSHandler.handle_ocr_tts(handler, {'image': 'aW1n', 'voice': 'af_bella'})
+
+        events = [json.loads(line) for line in handler.wfile.getvalue().decode('utf-8').splitlines() if line]
+        texts = [e['text'] for e in events if e['type'] == 'text']
+        spoken = '\n'.join(texts)
+
+        self.assertNotIn('*', spoken)
+        self.assertNotIn('🎉', spoken)
+        self.assertEqual(spoken, 'Big heading\nfirst bullet\nPlain tail.')
+        self.assertTrue(events[-1]['type'] == 'done')
+        self.assertEqual(events[-1]['text'], spoken)
+        self.assertTrue(any(e['type'] == 'audio' and e['text'] == 'Big heading' for e in events))
+
+
 class ManagedLifetimeTests(unittest.TestCase):
     def setUp(self):
         # Reset globals each test so ordering can never leak state.
