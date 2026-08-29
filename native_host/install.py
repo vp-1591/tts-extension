@@ -23,9 +23,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tts_native_host import HOST_NAME
 
-# Pinned unpacked-extension ID (derived from the "key" field in manifest.json).
+# Pinned unpacked-extension ID (SHA-256 of the manifest "key" DER, first 32 hex
+# digits mapped 0-9a-f -> a-p — a full Chrome ID is 32 chars, never 16).
 # Overridable with --extension-id; required if left empty.
-DEFAULT_EXTENSION_ID = 'isdactysjoifvgcc'
+DEFAULT_EXTENSION_ID = 'habcfbjmnckpiaockfecaibphndkacac'
 
 # kokoro requires Python >=3.10,<3.13 (its numpy==1.26.4 pin has no cp313 wheels),
 # so the server/host run under the project's Python 3.12 venv by default.

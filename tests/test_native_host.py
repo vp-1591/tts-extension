@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'native_host'))
 
 tts_native_host = importlib.import_module('tts_native_host')
+install = importlib.import_module('install')
 
 
 class NativeMessagingProtocolTests(unittest.TestCase):
@@ -44,6 +45,28 @@ class HealthTests(unittest.TestCase):
     def test_health_returns_none_when_unreachable(self):
         with patch('tts_native_host.urllib.request.urlopen', side_effect=OSError('refused')):
             self.assertIsNone(tts_native_host.health())
+
+
+class ExtensionIdTests(unittest.TestCase):
+    """Guards the installer's default allowed_origins ID.
+
+    A Chrome extension ID is always 32 chars a-p (first 32 hex digits of
+    SHA-256 of the manifest key's DER SPKI, mapped 0-f -> a-p). A truncated
+    16-char constant yields 'Access to the specified native messaging host
+    is forbidden' at runtime and survived unit tests until a live-browser
+    test caught it.
+    """
+
+    def test_default_id_matches_manifest_key_derivation(self):
+        import base64
+        import hashlib
+
+        manifest_key = json.loads((ROOT / 'manifest.json').read_text())['key']
+        digest = hashlib.sha256(base64.b64decode(manifest_key)).hexdigest()
+        derived = ''.join(chr(ord('a') + int(c, 16)) for c in digest[:32])
+
+        self.assertEqual(install.DEFAULT_EXTENSION_ID, derived)
+        self.assertRegex(install.DEFAULT_EXTENSION_ID, r'^[a-p]{32}$')
 
 
 class SpawnServerTests(unittest.TestCase):
