@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import subprocess
@@ -110,8 +111,8 @@ def maybe_start_watchdog(server) -> None:
 
         threading.Thread(target=watchdog, name='panel-watchdog', daemon=True).start()
 
-OCR_SYSTEM_PROMPT_PLAIN = """Transcribe all readable text from this screenshot. Output ONLY the transcribed text, nothing else. Do not describe the image."""
-OCR_SYSTEM_PROMPT_CONSTRAINED = """You are an OCR assistant. Read the text in the image and follow the user's instructions exactly. Do not describe the image."""
+OCR_SYSTEM_PROMPT_PLAIN = """Transcribe all readable text from this screenshot. Output ONLY the transcribed text, nothing else. Do not describe the image. Output plain text only: no markdown, no asterisks, no bullet markers, no emojis, no emphasis. Transcribe lists as plain lines."""
+OCR_SYSTEM_PROMPT_CONSTRAINED = """You are an OCR assistant. Read the text in the image and follow the user's instructions exactly. Do not describe the image. Output plain text only: no markdown, no asterisks, no bullet markers, no emojis, no emphasis. Transcribe lists as plain lines."""
 
 
 def new_conversation() -> str:
@@ -452,6 +453,55 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
     raise RuntimeError(f"OCR failed after {OCR_MAX_RETRIES} attempts: {last_err}")
 
 
+# --- Speech-friendly output cleanup ---
+# The vision model decorates transcriptions with markdown and emoji regardless
+# of the system prompt, and Kokoro reads markup tokens aloud ("star star").
+# Code content is deliberately untouched — users who need verbatim symbols pass
+# their own constraints; the sanitizer removes formatting, never content.
+_EMOJI_RANGES = (
+    (0x1F000, 0x1FAFF),  # emoji and pictographs
+    (0x2190, 0x21FF),    # arrows
+    (0x2600, 0x27BF),    # misc symbols and dingbats
+    (0x2B00, 0x2BFF),    # misc symbols and arrows
+    (0xFE00, 0xFE0F),    # variation selectors (emoji presentation)
+)
+_ZWJ = chr(0x200D)  # joins emoji into sequences
+_EMOJI_RE = re.compile(
+    '[' + ''.join(f'{chr(lo)}-{chr(hi)}' for lo, hi in _EMOJI_RANGES) + _ZWJ + ']+')
+
+# (pattern, replacement) applied in order; paired markup first so emphasis
+# content survives, then structural markers.
+_MARKUP_RULES = [
+    (re.compile(r'\*\*\*(.+?)\*\*\*'), r'\1'),
+    (re.compile(r'\*\*(.+?)\*\*'), r'\1'),
+    (re.compile(r'(?<![\w*])\*([^*\n]+?)\*(?![\w*])'), r'\1'),
+    (re.compile(r'~~(.+?)~~'), r'\1'),
+    (re.compile(r'!?\[([^\]]*)\]\([^)]*\)'), r'\1'),  # links/images -> alt text
+    (re.compile(r'`+'), ''),
+    (re.compile(r'^[ \t]{0,3}#{1,6}[ \t]+', re.MULTILINE), ''),  # ATX headers
+    (re.compile(r'^\s*(?:[-*_][ \t]*){3,}\s*$', re.MULTILINE), ''),  # hr rules
+    # Bullets only at line start: an em dash or ">" mid-sentence is prose
+    # ("Paris — the capital", "10 > 5"), not a list marker.
+    (re.compile(r'^[ \t]*(?:[-*' + chr(0x2022) + chr(0x00B7) + chr(0x2023) + chr(0x25AA) + r'][ \t]+)', re.MULTILINE), ''),
+    (re.compile(r'^[ \t]*\[[ xX]\][ \t]+', re.MULTILINE), ''),  # checkboxes
+]
+
+
+def sanitize_for_speech(text: str) -> str:
+    """Strip markdown markup and emoji so transcriptions speak cleanly.
+
+    Paired markup removed anywhere; line-start bullets removed (the \n segment
+    split already gives the pause); emojis dropped silently. Orphan markers
+    from a markup pair split across segments are trimmed at segment edges.
+    """
+    for pattern, replacement in _MARKUP_RULES:
+        text = pattern.sub(replacement, text)
+    text = _EMOJI_RE.sub('', text)
+    # A markup pair split across a \n segment boundary leaves stray '*'s.
+    text = re.sub(r'^[ \t*]+|[ \t*]+$', '', text, flags=re.MULTILINE)
+    return re.sub(r'\n\s*\n', '\n', re.sub(r'[\t ]{2,}', ' ', text)).strip()
+
+
 def pop_tts_segment(buffer: str, force: bool = False) -> tuple[str | None, str]:
     """Return a speakable prefix, keeping incomplete trailing text buffered."""
     if not buffer.strip():
@@ -616,6 +666,9 @@ class TTSHandler(BaseHTTPRequestHandler):
                     segment, buffer = pop_tts_segment(buffer)
                     if not segment:
                         break
+                    segment = sanitize_for_speech(segment)
+                    if not segment:
+                        continue
                     self.send_stream_event({'type': 'text', 'text': segment})
                     try:
                         tts_start = time.time()
@@ -634,6 +687,8 @@ class TTSHandler(BaseHTTPRequestHandler):
 
             segment, buffer = pop_tts_segment(buffer, force=True)
             if segment:
+                segment = sanitize_for_speech(segment)
+            if segment:
                 self.send_stream_event({'type': 'text', 'text': segment})
                 try:
                     tts_start = time.time()
@@ -648,7 +703,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                         self.send_stream_event({'type': 'error', 'error': f'GPU error during audio generation: {tts_err}. Try again.'})
                         return
 
-            text = ''.join(full_text).strip()
+            text = sanitize_for_speech(''.join(full_text))
             if not text:
                 self.send_stream_event({'type': 'error', 'error': 'No text found in image'})
                 return
