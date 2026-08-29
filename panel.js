@@ -125,8 +125,9 @@ async function checkHealth() {
   if (!r) {
     setStatus('⏳ Starting server...', 'warn');
     requestAutoStart();
-    if (await pollUntilHealthy()) {
-      goOnline();
+    const d = await pollUntilHealthy();
+    if (d) {
+      goOnline(d);
     } else {
       renderOffline();
     }
@@ -134,20 +135,20 @@ async function checkHealth() {
   }
   const d = await r.json();
   if (d.model_loaded) {
-    goOnline();
+    goOnline(d);
   } else {
     setStatus('⏳ Starting server (model loading)...', 'warn');
     if (await pollUntilHealthy()) {
-      goOnline();
+      goOnline(d);
     } else {
       renderOffline();
     }
   }
 }
 
-function goOnline() {
+function goOnline(d) {
   serverOnline = true;
-  statusEl.textContent = '✓ Server online';
+  statusEl.textContent = `✓ Server online (${d?.vision || '?'})`;
   statusEl.className = 'status ok';
   btnRead.disabled = false;
   startHeartbeat();
