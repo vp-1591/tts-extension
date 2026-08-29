@@ -1,26 +1,39 @@
 ## Rules
 
-Run project tests from WSL because the Kokoro server and its runtime dependencies work from WSL.
+The Kokoro server runs natively on **Windows** under the project's Python 3.12 venv at
+`.venv/Scripts/python.exe` (kokoro requires `>=3.10,<3.13`; 3.13 cannot install it). Do not
+run the server or the tests from WSL; there is no WSL fallback.
 
-Kokoro server works from WSL. Launch `kokoro_server` via WSL with:
+The server is started and stopped automatically by the extension: the side panel spawns it
+through the `com.vp1591.tts_server` native-messaging host (`native_host/install.py` registers
+it once under HKCU). Extension-spawned servers run with `--managed` and self-stop after
+`HEARTBEAT_GRACE` (90 s) without a panel heartbeat. Servers started manually — without
+`--managed` — never self-stop.
+
+To launch the server by hand:
 
 ```bash
-python3 ~/hermes-workdir/tts-extension/kokoro_server.py
+./.venv/Scripts/python.exe kokoro_server.py
 ```
 
 ## Logs
 
-Server logs are written to `logs/server.log` inside the project directory. In WSL the path is:
+Server logs are written to `logs/server.log` inside the project directory
+(`logs/server_spawner.log` holds early-startup output from extension-spawned servers).
+Logs include TTFT (time to first token), TPS (tokens/chars per second), auto-stop lines
+from the managed watchdog, and all errors with tracebacks.
 
-```
-~/hermes-workdir/tts-extension/logs/server.log
-```
+## Tests
 
-Logs include TTFT (time to first token), TPS (tokens/chars per second), and all errors with tracebacks.
+Run with Windows Python 3.13 and `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__/` is created:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 ./.venv/Scripts/python.exe -m pytest tests/ -v
+```
 
 ## __pycache__ warning
 
-Chrome rejects loading extensions if the directory contains `__pycache__/` (filenames starting with `_` are reserved). If you run Python tests or import the server module, `__pycache__/` gets created. Always delete it before loading the extension:
+Chrome rejects loading extensions if the directory contains `__pycache__/` (filenames starting with `_` are reserved). If you run Python tests or import the server module without `PYTHONDONTWRITEBYTECODE=1`, `__pycache__/` gets created. Always delete it before loading the extension:
 
 ```bash
 find . -name '__pycache__' -type d -exec rm -rf {} +

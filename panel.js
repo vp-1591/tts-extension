@@ -59,17 +59,119 @@ btnNewConv.addEventListener('click', async () => {
   }
 });
 
-async function checkHealth() {
+const START_POLL_MS = 1500;
+const START_TIMEOUT_MS = 90000;
+const HEARTBEAT_INTERVAL_MS = 15000;
+const HEARTBEAT_TIMEOUT_MS = 4000;
+// The server is single-threaded: a heartbeat can queue behind an in-flight
+// /ocr_tts for a long time, so only 3 consecutive failures mean "offline".
+const HEARTBEAT_MAX_FAILURES = 3;
+const NATIVE_HOST = 'com.vp1591.tts_server';
+
+let nativePort = null;
+let serverOnline = false;
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = `status ${cls}`;
+}
+
+function renderOffline() {
+  serverOnline = false;
+  btnRead.disabled = true;
+  setStatus('✗ Server offline — auto-start failed. Run: python native_host\\install.py', 'err');
+}
+
+// Chrome cannot spawn processes from a web page, so the panel asks the
+// registered native-messaging host to start the server. The spawner exits
+// after reporting — a later onDisconnect is expected and ignored.
+function requestAutoStart() {
   try {
-    const r = await fetch(`${SERVER}/health`);
-    const d = await r.json();
-    statusEl.textContent = `✓ Server online (${d.vision || '?'})`;
-    statusEl.className = 'status ok';
-    btnRead.disabled = false;
-  } catch {
-    statusEl.textContent = '✗ Server offline — start kokoro_server.py';
-    statusEl.className = 'status err';
-    btnRead.disabled = true;
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
+  } catch (e) {
+    renderOffline();
+    return;
+  }
+  nativePort.onMessage.addListener((msg) => {
+    if (msg.type === 'starting' || msg.type === 'ready') {
+      setStatus('⏳ Starting server (model loading)...', 'warn');
+    } else if (msg.type === 'failed') {
+      renderOffline();
+    }
+  });
+  nativePort.onDisconnect.addListener(() => {
+    nativePort = null;
+  });
+}
+
+async function pollUntilHealthy() {
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${SERVER}/health`);
+      const d = await r.json();
+      if (d.model_loaded) return d;
+      setStatus('⏳ Starting server (model loading)...', 'warn');
+    } catch {
+      setStatus('⏳ Starting server...', 'warn');
+    }
+    await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+  }
+  return null;
+}
+
+async function checkHealth() {
+  const r = await fetch(`${SERVER}/health`).catch(() => null);
+  if (!r) {
+    setStatus('⏳ Starting server...', 'warn');
+    requestAutoStart();
+    const d = await pollUntilHealthy();
+    if (d) {
+      goOnline(d);
+    } else {
+      renderOffline();
+    }
+    return;
+  }
+  const d = await r.json();
+  if (d.model_loaded) {
+    goOnline(d);
+  } else {
+    setStatus('⏳ Starting server (model loading)...', 'warn');
+    if (await pollUntilHealthy()) {
+      goOnline(d);
+    } else {
+      renderOffline();
+    }
+  }
+}
+
+function goOnline(d) {
+  serverOnline = true;
+  statusEl.textContent = `✓ Server online (${d?.vision || '?'})`;
+  statusEl.className = 'status ok';
+  btnRead.disabled = false;
+  startHeartbeat();
+}
+
+async function startHeartbeat() {
+  let failures = 0;
+  while (serverOnline) {
+    await new Promise((resolve) => setTimeout(resolve, HEARTBEAT_INTERVAL_MS));
+    if (!serverOnline) return;
+    let beat = false;
+    try {
+      const r = await fetch(`${SERVER}/panel-heartbeat`, { method: 'POST', signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS) });
+      beat = r.ok;
+    } catch {
+      beat = false;
+    }
+    if (beat) {
+      failures = 0;
+    } else if (++failures >= HEARTBEAT_MAX_FAILURES) {
+      checkHealth();
+      return;
+    }
   }
 }
 

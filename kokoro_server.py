@@ -3,6 +3,7 @@
 
 POST /tts       { "text": "...", "voice": "af_bella" }  -> audio/wav
 POST /ocr_tts   { "image": "<base64_png>" }              -> NDJSON text/audio stream
+POST /panel-heartbeat  (empty body)                      -> liveness ping
 GET  /voices     -> list of voices
 GET  /health     -> status
 """
@@ -41,9 +42,12 @@ def setup_logging():
     handler = logging.FileHandler(log_file, encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logging.root.addHandler(handler)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-    logging.root.addHandler(stream_handler)
+    # Echo to the console only when attached to a TTY; the native host redirects
+    # stdout to a log file, which would otherwise duplicate every line.
+    if sys.stdout and sys.stdout.isatty():
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logging.root.addHandler(stream_handler)
     logging.root.setLevel(logging.INFO)
 
 # --- Conversation storage ---
@@ -54,10 +58,57 @@ conv_lock = threading.Lock()
 # --- Globals ---
 pipeline = None
 pipeline_lock = threading.Lock()
+MODEL_LOADED = False
 VISION_MODEL = os.environ.get('VISION_MODEL', 'gemma4:31b:cloud')
 VISION_API_BASE = os.environ.get('VISION_API_BASE', 'http://127.0.0.1:11434')
 VISION_API_KEY = os.environ.get('VISION_API_KEY', 'ollama')
 OLLAMA_STARTUP_TIMEOUT = float(os.environ.get('OLLAMA_STARTUP_TIMEOUT', '15'))
+
+# --- Managed lifetime (auto-stop) ---
+# Servers spawned by the extension run with --managed: the side panel POSTs
+# /panel-heartbeat every 15s, and if no heartbeat (or other in-flight activity)
+# arrives within HEARTBEAT_GRACE seconds the server shuts itself down. A
+# manually started server (no --managed) never self-stops.
+MANAGED = False
+HEARTBEAT_GRACE = float(os.environ.get('HEARTBEAT_GRACE', '90'))
+_heartbeat_at = time.monotonic()
+_heartbeat_lock = threading.Lock()
+
+
+def touch_heartbeat() -> None:
+    """Record liveness. In-flight requests call this too: the single-threaded
+    server queues /panel-heartbeat behind long streams, so activity must refresh
+    the watchdog directly instead of waiting for heartbeat requests to drain."""
+    global _heartbeat_at
+    with _heartbeat_lock:
+        _heartbeat_at = time.monotonic()
+
+
+def seconds_since_heartbeat() -> float:
+    with _heartbeat_lock:
+        return time.monotonic() - _heartbeat_at
+
+
+def _watchdog_tick(server) -> bool:
+    """One watchdog check. Returns True if the server was told to shut down."""
+    idle = seconds_since_heartbeat()
+    if idle > HEARTBEAT_GRACE:
+        logging.info(f"[SERVER] Auto-stopping (no panel heartbeat for {idle:.0f}s)")
+        server.shutdown()
+        return True
+    return False
+
+
+def maybe_start_watchdog(server) -> None:
+    """Watchdog only makes sense in extension-spawned (--managed) mode."""
+    if MANAGED:
+        def watchdog():
+            while True:
+                time.sleep(5)
+                if _watchdog_tick(server):
+                    return
+
+        threading.Thread(target=watchdog, name='panel-watchdog', daemon=True).start()
 
 OCR_SYSTEM_PROMPT_PLAIN = """Transcribe all readable text from this screenshot. Output ONLY the transcribed text, nothing else. Do not describe the image."""
 OCR_SYSTEM_PROMPT_CONSTRAINED = """You are an OCR assistant. Read the text in the image and follow the user's instructions exactly. Do not describe the image."""
@@ -133,13 +184,14 @@ def save_turn(conv_id: str, image_bytes: bytes, prompt: str, ocr_text: str) -> N
 
 
 def get_pipeline():
-    global pipeline
+    global pipeline, MODEL_LOADED
     with pipeline_lock:
         if pipeline is None:
             for device in ('cuda', 'cpu'):
                 try:
                     logging.info(f"[SERVER] Loading Kokoro model on {device}...")
                     pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device=device)
+                    MODEL_LOADED = True
                     logging.info(f"[SERVER] Kokoro model loaded on {device}.")
                     return pipeline
                 except Exception as e:
@@ -157,7 +209,7 @@ def get_pipeline():
 
 def reset_pipeline():
     """Reset the Kokoro pipeline, clearing GPU memory. Next call to get_pipeline() will reload."""
-    global pipeline
+    global pipeline, MODEL_LOADED
     with pipeline_lock:
         if pipeline is not None:
             logging.warning("[SERVER] Resetting Kokoro pipeline due to CUDA error...")
@@ -167,6 +219,7 @@ def reset_pipeline():
             except Exception:
                 pass
             pipeline = None
+            MODEL_LOADED = False
             logging.info("[SERVER] Pipeline reset. Will reload on next request.")
 
 
@@ -448,7 +501,7 @@ class TTSHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
             self.send_json({'status': 'ok', 'model': 'kokoro-82M', 'vision': VISION_MODEL,
-                            'streaming': True})
+                            'streaming': True, 'model_loaded': MODEL_LOADED, 'managed': MANAGED})
         elif self.path == '/voices':
             self.send_json({'voices': [
                 'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
@@ -464,6 +517,11 @@ class TTSHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/new_conversation':
             self.handle_new_conversation()
+            return
+
+        if self.path == '/panel-heartbeat':
+            touch_heartbeat()
+            self.send_json({'ok': True})
             return
 
         content_length = int(self.headers.get('Content-Length', 0))
@@ -498,6 +556,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             duration = len(wav_bytes) / (SAMPLE_RATE * 2)  # rough estimate
             tps = len(text) / elapsed if elapsed > 0 else 0
             logging.info(f"[TTS] {elapsed:.1f}s for {len(text)} chars, TPS: {tps:.1f} chars/s")
+            touch_heartbeat()  # in-flight request; see touch_heartbeat
             self.send_wav(wav_bytes)
         except Exception as e:
             logging.error(f"[TTS ERROR] {e}")
@@ -550,6 +609,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             audio_chunks = 0
 
             for fragment in ocr_image_stream(image_bytes, constraints=constraints, history_turns=history_turns):
+                touch_heartbeat()  # in-flight request; see touch_heartbeat
                 full_text.append(fragment)
                 buffer += fragment
                 while True:
@@ -635,6 +695,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(e))
 
     def send_stream_event(self, obj):
+        touch_heartbeat()  # a stream still sending events is alive; see touch_heartbeat
         body = (json.dumps(obj) + '\n').encode('utf-8')
         self.wfile.write(body)
         self.wfile.flush()
@@ -668,32 +729,56 @@ class TTSHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    global MANAGED
     parser = argparse.ArgumentParser(description='Kokoro TTS + Vision OCR server')
     parser.add_argument('--port', type=int, default=5912)
     parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--managed', action='store_true',
+                        help='auto-stop when panel heartbeats stop (extension-spawned mode)')
     args = parser.parse_args()
+    MANAGED = args.managed
 
     setup_logging()
-    logging.info(f"[SERVER] Starting on {args.host}:{args.port}")
-    ensure_ollama_running()
+    logging.info(f"[SERVER] Starting on {args.host}:{args.port} (managed={MANAGED})")
     ensure_conversation_dir()
-    try:
-        get_pipeline()  # pre-load model
-    except Exception as e:
-        logging.warning(f"[SERVER] Pre-load failed ({e}); model will load on first request.")
 
     # Allow large payloads (screenshots can be ~5MB base64)
     # Override both server and handler limits
     import http.server
     http.server.BaseHTTPRequestHandler.max_request_line = 10 * 1024 * 1024  # 10MB
 
-    server = HTTPServer((args.host, args.port), TTSHandler)
-    server.allow_reuse_address = True
+    # Bind before loading the model so /health answers (reporting model_loaded:
+    # false) while the ~10s load runs — the panel can tell "starting" from
+    # "crashed". allow_reuse_address defaults to True, but on Windows
+    # SO_REUSEADDR lets two processes silently share a port, so rebind races
+    # must fail loudly with WSAEADDRINUSE instead.
+    server = HTTPServer((args.host, args.port), TTSHandler, bind_and_activate=False)
+    server.allow_reuse_address = False
+    try:
+        server.server_bind()
+        server.server_activate()
+    except OSError as e:
+        logging.error(f"[SERVER] Could not bind {args.host}:{args.port} — is another kokoro_server already running? ({e})")
+        raise SystemExit(1)
+
+    touch_heartbeat()  # start the grace period now; the panel takes over once online
+    maybe_start_watchdog(server)
+
+    def load_model():
+        try:
+            ensure_ollama_running()
+            get_pipeline()  # pre-load model; sets MODEL_LOADED on success
+        except Exception as e:
+            logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.")
+
+    threading.Thread(target=load_model, name='model-loader', daemon=True).start()
+
     logging.info(f"[SERVER] Ready at http://{args.host}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logging.info("[SERVER] Shutting down.")
+    finally:
         server.server_close()
 
 

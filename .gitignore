@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 conversations/
 logs/
+tmp/
+bmad-*/
+_bmad/
+native_host/*.json
+native_host/*.bat
+.venv/
