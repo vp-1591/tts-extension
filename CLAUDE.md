@@ -44,3 +44,5 @@ The `.gitignore` already excludes `__pycache__/`, but the directory can still ap
 ## Test maintenance
 
 - When changing anything add or update focused tests that cover the changed behavior and any reported regression.
+
+@~/.claude/shared/adr-workflow.md
