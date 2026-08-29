@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -84,6 +85,100 @@ class KokoroServerTests(unittest.TestCase):
         self.assertIn('activeTab', manifest['permissions'])
         self.assertIn('<all_urls>', manifest['host_permissions'])
         self.assertIn('http://127.0.0.1:5912/*', manifest['host_permissions'])
+
+    def test_manifest_allows_native_messaging_and_pins_id(self):
+        manifest = json.loads((ROOT / 'manifest.json').read_text())
+
+        self.assertIn('nativeMessaging', manifest['permissions'])
+        # The "key" field pins the unpacked extension ID so the native host
+        # manifest's allowed_origins can stay a single constant.
+        self.assertTrue(manifest.get('key'))
+
+
+class ManagedLifetimeTests(unittest.TestCase):
+    def setUp(self):
+        # Reset globals each test so ordering can never leak state.
+        self.orig_managed = kokoro_server.MANAGED
+        kokoro_server.MANAGED = False
+
+    def tearDown(self):
+        kokoro_server.MANAGED = self.orig_managed
+
+    def make_handler(self):
+        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
+        handler.rfile = io.BytesIO(b'')
+        handler.wfile = FlushableBytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+    def test_heartbeat_endpoint_updates_last_seen(self):
+        handler = self.make_handler()
+        handler.path = '/panel-heartbeat'
+        handler.headers = {}
+        kokoro_server._heartbeat_at = time.monotonic() - kokoro_server.HEARTBEAT_GRACE
+        try:
+            kokoro_server.TTSHandler.do_POST(handler)
+            self.assertLess(kokoro_server.seconds_since_heartbeat(), 5)
+            self.assertIn(b'"ok"', handler.wfile.getvalue())
+        finally:
+            kokoro_server.touch_heartbeat()
+
+    def test_watchdog_tick_shuts_down_after_grace(self):
+        fake_server = MagicMock()
+        kokoro_server._heartbeat_at = time.monotonic() - (kokoro_server.HEARTBEAT_GRACE + 5)
+
+        self.assertTrue(kokoro_server._watchdog_tick(fake_server))
+        fake_server.shutdown.assert_called_once()
+
+    def test_watchdog_tick_spares_fresh_heartbeat(self):
+        fake_server = MagicMock()
+        kokoro_server.touch_heartbeat()
+
+        self.assertFalse(kokoro_server._watchdog_tick(fake_server))
+        fake_server.shutdown.assert_not_called()
+
+    def test_watchdog_not_started_when_unmanaged(self):
+        with patch('kokoro_server.threading.Thread') as thread_ctor:
+            kokoro_server.maybe_start_watchdog(MagicMock())
+        thread_ctor.assert_not_called()
+
+    def test_watchdog_started_when_managed(self):
+        kokoro_server.MANAGED = True
+        with patch('kokoro_server.threading.Thread') as thread_ctor:
+            kokoro_server.maybe_start_watchdog(MagicMock())
+        thread_ctor.assert_called_once()
+
+    def test_stream_event_refreshes_heartbeat(self):
+        handler = self.make_handler()
+        kokoro_server._heartbeat_at = time.monotonic() - kokoro_server.HEARTBEAT_GRACE
+        try:
+            kokoro_server.TTSHandler.send_stream_event(handler, {'type': 'text', 'text': 'hi'})
+            self.assertLess(kokoro_server.seconds_since_heartbeat(), 5)
+        finally:
+            kokoro_server.touch_heartbeat()
+
+    def test_health_reports_model_loaded_and_managed(self):
+        handler = self.make_handler()
+        handler.path = '/health'
+        handler.headers = {}
+        kokoro_server.MODEL_LOADED = True
+        kokoro_server.MANAGED = True
+        try:
+            kokoro_server.TTSHandler.do_GET(handler)
+            body = json.loads(handler.wfile.getvalue())
+            self.assertTrue(body['model_loaded'])
+            self.assertTrue(body['managed'])
+        finally:
+            kokoro_server.MODEL_LOADED = False
+            kokoro_server.MANAGED = False
+
+    def test_get_vision_api_bases_single_candidate_on_windows(self):
+        # Windows never reads /proc/net/route, so only the loopback base remains.
+        with patch.object(kokoro_server, '_read_linux_default_gateway', return_value=None), \
+             patch.object(kokoro_server, 'VISION_API_BASE', 'http://127.0.0.1:11434'):
+            self.assertEqual(kokoro_server.get_vision_api_bases(), ['http://127.0.0.1:11434'])
 
 
 class ConversationTests(unittest.TestCase):

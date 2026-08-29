@@ -2,8 +2,9 @@
   "manifest_version": 3,
   "name": "TTS Screen Reader",
   "description": "Screenshot → OCR → Read aloud. Reads scanned PDFs and images that Narrator can't.",
-  "version": "2.0",
-  "permissions": ["activeTab", "sidePanel"],
+  "version": "2.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1xKIFdu2rdetV3urMOvKSWyoCZJoVAFrvNXvYvmWqjwh8QWnt7gcFDGAoCov+G6LXXXen0ZwL4ED/VGZfr/TZ+3bynQ9sVD224+mgpLz+J6XDrd0qz3q7AOKfbeTVUgem/MDSuBjgUMfvGltfAbyO8VtqCMLzs5WsxZ8B4fDxFudhKEKOjCwJC646FGyJlsMq3bLjvSm2mOwAyMT8g+dRo7Yh8btzxaaSA841NDgOkNM+nLTl1DiCn8XHzx0u00eyOo8i4Kc8e0DIxSeeVGkML1rRFNrUJ3ex4TZ2UexgEhfdk07S8WQpCFryNKETNAVJER7DbQsMuKq39MogAXXPQIDAQAB",
+  "permissions": ["activeTab", "sidePanel", "nativeMessaging"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:5912/*"],
   "action": {
     "default_title": "TTS Screen Reader",
