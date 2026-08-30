@@ -37,11 +37,19 @@ def _boot(msg: str) -> None:
 
 @contextmanager
 def _phase(name: str):
-    """Log how long a startup phase took, in ms."""
+    """Log how long a startup phase took, in ms.
+
+    A failing phase logs 'failed after Nms' instead, so a crashed startup
+    never contributes a success-shaped 'took Nms' sample to the baseline.
+    """
     t0 = time.monotonic()
     try:
         yield
-    finally:
+    except BaseException:
+        ms = int((time.monotonic() - t0) * 1000)
+        logging.info(f"[PHASE] {name} failed after {ms}ms")
+        raise
+    else:
         ms = int((time.monotonic() - t0) * 1000)
         logging.info(f"[PHASE] {name} took {ms}ms")
 
@@ -820,7 +828,6 @@ def main():
                         help='auto-stop when panel heartbeats stop (extension-spawned mode)')
     args = parser.parse_args()
     MANAGED = args.managed
-    t_start = time.monotonic()
 
     setup_logging()
     logging.info(f"[SERVER] Imports took {time.monotonic() - _BOOT_START:.2f}s")
@@ -860,7 +867,9 @@ def main():
 
     threading.Thread(target=load_model, name='model-loader', daemon=True).start()
 
-    logging.info(f"[SERVER] Ready at http://{args.host}:{args.port} (startup {time.monotonic() - t_start:.2f}s)")
+    # Anchored at _BOOT_START so 'startup' spans the import phase too — the
+    # dominant cost (see issues #6-#10) — not just post-argparse bring-up.
+    logging.info(f"[SERVER] Ready at http://{args.host}:{args.port} (startup {time.monotonic() - _BOOT_START:.2f}s)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

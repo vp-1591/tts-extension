@@ -395,6 +395,15 @@ class StartupTimingTests(unittest.TestCase):
         self.assertIn('[PHASE] x took', logs.output[-1])
         self.assertRegex(logs.output[-1], r'took \d+ms$')
 
+    def test_phase_logs_failed_shape_when_body_raises(self):
+        # A crashing phase must not contribute a success-shaped 'took Nms'
+        # line to the startup baseline.
+        with self.assertRaises(ValueError), self.assertLogs(level='INFO') as logs:
+            with kokoro_server._phase('x'):
+                raise ValueError('boom')
+
+        self.assertRegex(logs.output[-1], r'\[PHASE\] x failed after \d+ms$')
+
     def test_get_pipeline_logs_model_load_ms(self):
         with self.assertLogs(level='INFO') as logs:
             result = kokoro_server.get_pipeline()

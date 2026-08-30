@@ -70,16 +70,44 @@ class ExtensionIdTests(unittest.TestCase):
 
 
 class SpawnServerTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_fp = tts_native_host.spawner_fp
+        tts_native_host.spawner_fp = None
+
+    def tearDown(self):
+        if tts_native_host.spawner_fp is not None:
+            tts_native_host.spawner_fp.close()
+        tts_native_host.spawner_fp = self._orig_fp
+
     def test_spawn_server_launches_managed_server_from_repo(self):
+        import tempfile
         popen = MagicMock()
-        with patch('tts_native_host.subprocess.Popen', return_value=popen) as popen_ctor:
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(tts_native_host, 'SPAWNER_LOG', Path(tmp_dir) / 'spawner.log'), \
+                patch('tts_native_host.subprocess.Popen', return_value=popen) as popen_ctor:
             tts_native_host.spawn_server()
 
-        popen_ctor.assert_called_once()
-        args, kwargs = popen_ctor.call_args
-        self.assertEqual(args[0][1:], ['-X', 'utf8', str(tts_native_host.REPO / 'kokoro_server.py'),
-                                       '--managed'])
-        self.assertEqual(kwargs['cwd'], tts_native_host.REPO)
+            popen_ctor.assert_called_once()
+            args, kwargs = popen_ctor.call_args
+            self.assertEqual(args[0][1:], ['-X', 'utf8', str(tts_native_host.REPO / 'kokoro_server.py'),
+                                           '--managed'])
+            self.assertEqual(kwargs['cwd'], tts_native_host.REPO)
+            # The child must inherit the same handle _host_log() writes through:
+            # CRT append flags don't survive process inheritance, so a second
+            # open would let the child write at stale offsets and clobber
+            # [HOST] lines appended past them.
+            self.assertIs(kwargs['stdout'], tts_native_host.spawner_fp)
+            # Close before the TemporaryDirectory context exits, or Windows
+            # blocks its cleanup while the handle is still open.
+            tts_native_host.spawner_fp.close()
+            tts_native_host.spawner_fp = None
+        import os
+        try:
+            os.unlink(tmp_dir + '/spawner.log')
+            print('DBG-UNLINK-OK')
+        except OSError as e:
+            print('DBG-UNLINK-FAIL', e)
+            print('DBG-open-handles?', 'unknown')
 
 
 class LogTailTests(unittest.TestCase):
@@ -117,7 +145,21 @@ class HostLogTests(unittest.TestCase):
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    def test_host_log_writes_through_shared_handle(self):
+        buf = io.BytesIO()
+        with patch.object(tts_native_host, 'spawner_fp', buf):
+            tts_native_host._host_log('spawned')
+
+        self.assertIn(b'[HOST] spawned', buf.getvalue())
+        # Handle must stay open — the spawned child still writes through it.
+        self.assertFalse(buf.closed)
+
     def test_host_log_survives_oserror(self):
-        bad_path = Path('Z:/nonexistent-dir/log') if not Path('Z:').exists() else Path('X:/nope/log')
-        with patch.object(tts_native_host, 'SPAWNER_LOG', bad_path):
+        # Opening an existing directory raises PermissionError (an OSError) on
+        # Windows, so the guard is exercised deterministically; the previous
+        # drive-letter probing was a silent no-op on machines with those
+        # drives mapped and could create files outside the repo.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                patch.object(tts_native_host, 'SPAWNER_LOG', Path(tmp_dir)):
             tts_native_host._host_log('x')  # must not raise

@@ -57,14 +57,22 @@ def health(timeout: float = 1.0):
         return None
 
 
+# Handle the spawned child inherits for stdout/stderr, so _host_log() and the
+# child share one file pointer. The CRT append flag of a mode-'ab' open does
+# not survive process inheritance: a second, separate open lets the child
+# write at its own stale offset, clobbering [HOST] lines appended past it.
+spawner_fp = None
+
+
 def spawn_server() -> subprocess.Popen:
+    global spawner_fp
     SPAWNER_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log = open(SPAWNER_LOG, 'ab')
+    spawner_fp = open(SPAWNER_LOG, 'ab')
     # sys.executable is the interpreter the .bat wrapper was generated with,
     # so the server runs under the same (CUDA-capable) Python as the host.
     return subprocess.Popen(
         [sys.executable, '-X', 'utf8', str(REPO / 'kokoro_server.py'), '--managed'],
-        stdout=log,
+        stdout=spawner_fp,
         stderr=subprocess.STDOUT,
         cwd=REPO,
     )
@@ -86,10 +94,16 @@ def _spawner_log_tail(limit: int = 2000) -> str:
 
 
 def _host_log(msg: str) -> None:
+    line = f'{time.strftime("%Y-%m-%d %H:%M:%S")} [HOST] {msg}\n'.encode('utf-8')
     try:
-        SPAWNER_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(SPAWNER_LOG, 'ab') as f:
-            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} [HOST] {msg}\n'.encode('utf-8'))
+        if spawner_fp is None:
+            # Child not spawned (or spawn failed) — safe to open transiently.
+            SPAWNER_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(SPAWNER_LOG, 'ab') as f:
+                f.write(line)
+        else:
+            spawner_fp.write(line)
+            spawner_fp.flush()
     except OSError:
         # Logging must never kill the host before it answers Chrome.
         pass
