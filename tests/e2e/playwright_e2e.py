@@ -173,7 +173,7 @@ def main():
                 return btn.inner_text(timeout=5000)
             panel.locator('#btn-read').click()
             t0 = time.monotonic()
-            deadline = time.monotonic() + 240
+            deadline = t0 + 240
             left_idle = False
             while time.monotonic() < deadline:
                 txt = btn_text()
