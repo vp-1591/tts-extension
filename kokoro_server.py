@@ -55,16 +55,6 @@ def _phase(name: str):
 
 _boot('stdlib imports done')
 
-os.environ.setdefault('TTS_SKIP_WARM', '1')
-
-# Heavy imports sit after the boot markers on purpose so the [BOOT] stderr lines
-# bracket them in server_spawner.log; the env line above is ruff-allowed here.
-import numpy as np  # noqa: E402
-import soundfile as sf  # noqa: E402
-from kokoro import KPipeline  # noqa: E402
-
-_boot('heavy imports done')
-
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
 
@@ -98,6 +88,8 @@ VISION_MODEL = os.environ.get('VISION_MODEL', 'gemma4:31b:cloud')
 VISION_API_BASE = os.environ.get('VISION_API_BASE', 'http://127.0.0.1:11434')
 VISION_API_KEY = os.environ.get('VISION_API_KEY', 'ollama')
 OLLAMA_STARTUP_TIMEOUT = float(os.environ.get('OLLAMA_STARTUP_TIMEOUT', '15'))
+TTS_WARMUP = os.environ.get('TTS_WARMUP', '1') != '0'
+HF_OFFLINE_IF_CACHED = os.environ.get('HF_OFFLINE_IF_CACHED', '1') != '0'
 
 # --- Managed lifetime (auto-stop) ---
 # Servers spawned by the extension run with --managed: the side panel POSTs
@@ -218,10 +210,41 @@ def save_turn(conv_id: str, image_bytes: bytes, prompt: str, ocr_text: str) -> N
         save_conversation(conv_id, conv_data)
 
 
+def _hf_cache_dir() -> Path:
+    """Resolve the HuggingFace hub cache directory the same way huggingface_hub does."""
+    if os.environ.get('HF_HUB_CACHE'):
+        return Path(os.environ['HF_HUB_CACHE'])
+    if os.environ.get('HF_HOME'):
+        return Path(os.environ['HF_HOME']) / 'hub'
+    return Path.home() / '.cache' / 'huggingface' / 'hub'
+
+
+def _kokoro_model_cached() -> bool:
+    """True when the Kokoro weights are already in the local HF cache, so no
+    network round-trip is needed and HF_HUB_OFFLINE can be set safely."""
+    try:
+        snapshots = _hf_cache_dir() / 'models--hexgrad--Kokoro-82M' / 'snapshots'
+        return any(
+            (d / 'config.json').is_file() and (d / 'kokoro-v1_0.pth').is_file()
+            for d in snapshots.iterdir() if d.is_dir()
+        )
+    except OSError:
+        return False
+
+
 def get_pipeline():
     global pipeline, MODEL_LOADED
     with pipeline_lock:
         if pipeline is None:
+            with _phase('heavy imports'):
+                # HF_HUB_OFFLINE must be set before the kokoro import:
+                # huggingface_hub reads it at import time. The check stays
+                # outside the device loop — an import crash is a real error,
+                # not a CUDA failure to retry on cpu.
+                if HF_OFFLINE_IF_CACHED and _kokoro_model_cached():
+                    os.environ['HF_HUB_OFFLINE'] = '1'
+                    logging.info("[SERVER] HF cache warm; HF_HUB_OFFLINE=1")
+                from kokoro import KPipeline
             for device in ('cuda', 'cpu'):
                 try:
                     logging.info(f"[SERVER] Loading Kokoro model on {device}...")
@@ -563,6 +586,9 @@ def pop_tts_segment(buffer: str, force: bool = False) -> tuple[str | None, str]:
 
 def text_to_wav(text: str, voice: str = DEFAULT_VOICE, _retry: bool = True) -> bytes:
     """Generate TTS audio and return WAV bytes. Retries once on CUDA errors."""
+    import numpy as np
+    import soundfile as sf
+
     pipe = get_pipeline()
     try:
         all_audio = []
@@ -830,7 +856,7 @@ def main():
     MANAGED = args.managed
 
     setup_logging()
-    logging.info(f"[SERVER] Imports took {time.monotonic() - _BOOT_START:.2f}s")
+    logging.info(f"[SERVER] Stdlib imports took {time.monotonic() - _BOOT_START:.2f}s")
     logging.info(f"[SERVER] Starting on {args.host}:{args.port} (managed={MANAGED})")
     ensure_conversation_dir()
 

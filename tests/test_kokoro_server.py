@@ -2,6 +2,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -413,6 +414,103 @@ class StartupTimingTests(unittest.TestCase):
         loaded_lines = [line for line in logs.output
                         if re.search(r'Kokoro model loaded on \w+ in \d+ms\.', line)]
         self.assertTrue(loaded_lines, 'expected a "loaded ... in Xms" line')
+
+
+class DeferredHeavyImportsTests(unittest.TestCase):
+    """Issue #6: numpy/soundfile/kokoro must not be imported at module level."""
+
+    def test_module_has_no_heavy_import_attributes(self):
+        for attr in ('np', 'sf', 'KPipeline'):
+            self.assertFalse(hasattr(kokoro_server, attr),
+                             f"'{attr}' should be deferred, not a module attribute")
+
+    def test_text_to_wav_works_with_deferred_imports(self):
+        pipe = MagicMock()
+        pipe.return_value = iter([(None, None, 'chunk')])
+        with patch.object(kokoro_server, 'get_pipeline', return_value=pipe):
+            wav = kokoro_server.text_to_wav('Hello.')
+
+        self.assertEqual(wav, b'')
+
+
+class HfOfflineGatingTests(unittest.TestCase):
+    """Issue #9: set HF_HUB_OFFLINE=1 before the kokoro import when the model is cached."""
+
+    def setUp(self):
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+        self._env_backup = {k: os.environ.get(k) for k in
+                            ('HF_HUB_CACHE', 'HF_HOME', 'HF_HUB_OFFLINE')}
+        # StartupTimingTests hit the real warm cache and leave this set.
+        os.environ.pop('HF_HUB_OFFLINE', None)
+
+    def tearDown(self):
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+
+    def test_hf_cache_dir_prefers_explicit_hf_hub_cache(self):
+        with patch.dict(os.environ, {'HF_HUB_CACHE': 'X:/hub', 'HF_HOME': 'Y:/home'}):
+            self.assertEqual(kokoro_server._hf_cache_dir(), Path('X:/hub'))
+
+    def test_hf_cache_dir_derives_from_hf_home(self):
+        with patch.dict(os.environ, {'HF_HOME': 'Y:/home'}, clear=False):
+            os.environ.pop('HF_HUB_CACHE', None)
+            self.assertEqual(kokoro_server._hf_cache_dir(), Path('Y:/home/hub'))
+
+    def test_hf_cache_dir_falls_back_to_default_location(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('HF_HUB_CACHE', None)
+            os.environ.pop('HF_HOME', None)
+            self.assertEqual(kokoro_server._hf_cache_dir(),
+                             Path.home() / '.cache' / 'huggingface' / 'hub')
+
+    def _make_cache(self, root: Path, with_pth: bool = True) -> Path:
+        snapshot = root / 'models--hexgrad--Kokoro-82M' / 'snapshots' / 'abc123'
+        snapshot.mkdir(parents=True)
+        (snapshot / 'config.json').write_text('{}')
+        if with_pth:
+            (snapshot / 'kokoro-v1_0.pth').write_bytes(b'weights')
+        return root
+
+    def test_kokoro_model_cached_true_when_snapshot_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertTrue(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_weights_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp), with_pth=False)
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_cache_missing(self):
+        with patch.object(kokoro_server, '_hf_cache_dir',
+                          return_value=Path('Z:/does-not-exist/hub')):
+            self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_get_pipeline_sets_hf_hub_offline_when_cache_warm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                with self.assertLogs(level='INFO') as logs:
+                    kokoro_server.get_pipeline()
+
+        self.assertEqual(os.environ.get('HF_HUB_OFFLINE'), '1')
+        self.assertTrue(any('HF cache warm' in line for line in logs.output))
+
+    def test_get_pipeline_leaves_offline_unset_when_cache_cold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(kokoro_server, '_hf_cache_dir',
+                              return_value=Path(tmp) / 'empty'):
+                kokoro_server.get_pipeline()
+
+        self.assertNotIn('HF_HUB_OFFLINE', os.environ)
 
 
 if __name__ == '__main__':
