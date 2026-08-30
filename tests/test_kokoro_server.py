@@ -1,17 +1,14 @@
 import importlib
 import io
 import json
-import os
 import shutil
 import sys
 import tempfile
-import threading
 import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -367,9 +364,7 @@ class HandlerTests(unittest.TestCase):
             kokoro_server.CURRENT_PTR = Path(tmp_dir) / 'current.txt'
 
             try:
-                result = kokoro_server.TTSHandler.do_POST(handler)
-                # The handler should have called handle_new_conversation
-                # which creates a conversation and sends JSON response
+                kokoro_server.TTSHandler.do_POST(handler)
             finally:
                 kokoro_server.CONVERSATIONS_DIR = orig_conv_dir
                 kokoro_server.CURRENT_PTR = orig_current_ptr
