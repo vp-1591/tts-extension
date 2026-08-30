@@ -85,11 +85,23 @@ def _spawner_log_tail(limit: int = 2000) -> str:
         return '(no spawner log written)'
 
 
+def _host_log(msg: str) -> None:
+    try:
+        SPAWNER_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SPAWNER_LOG, 'ab') as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} [HOST] {msg}\n'.encode('utf-8'))
+    except OSError:
+        # Logging must never kill the host before it answers Chrome.
+        pass
+
+
 def main() -> None:
     set_binary_stdio()
+    started_at = time.monotonic()
     send_message({'type': 'starting'})
 
     if health() is None:
+        _host_log('spawning kokoro_server.py --managed')
         spawn_server()
 
     deadline = time.monotonic() + READY_TIMEOUT
@@ -99,9 +111,11 @@ def main() -> None:
             # Covers both our own child and a server another host won the
             # double-open race with — /health is the single source of truth.
             send_message({'type': 'ready', 'model_loaded': bool(state.get('model_loaded'))})
+            _host_log(f'ready after {time.monotonic() - started_at:.2f}s')
             return
         time.sleep(1)
 
+    _host_log(f'failed after {time.monotonic() - started_at:.2f}s')
     send_message({'type': 'failed', 'error': _spawner_log_tail()})
 
 

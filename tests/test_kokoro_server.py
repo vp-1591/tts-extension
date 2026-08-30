@@ -1,6 +1,8 @@
+import contextlib
 import importlib
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -368,6 +370,40 @@ class HandlerTests(unittest.TestCase):
             finally:
                 kokoro_server.CONVERSATIONS_DIR = orig_conv_dir
                 kokoro_server.CURRENT_PTR = orig_current_ptr
+
+
+class StartupTimingTests(unittest.TestCase):
+    """Tests for startup phase-timing observability."""
+
+    def setUp(self):
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+
+    def test_boot_helper_writes_timestamped_stderr(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            kokoro_server._boot('test message')
+
+        self.assertIn('[BOOT] test message', stderr.getvalue())
+        self.assertRegex(stderr.getvalue(), r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+
+    def test_phase_logs_elapsed(self):
+        with self.assertLogs(level='INFO') as logs:
+            with kokoro_server._phase('x'):
+                pass
+
+        self.assertIn('[PHASE] x took', logs.output[-1])
+        self.assertRegex(logs.output[-1], r'took \d+ms$')
+
+    def test_get_pipeline_logs_model_load_ms(self):
+        with self.assertLogs(level='INFO') as logs:
+            result = kokoro_server.get_pipeline()
+
+        self.assertIsNotNone(result)
+        self.assertTrue(kokoro_server.MODEL_LOADED)
+        loaded_lines = [line for line in logs.output
+                        if re.search(r'Kokoro model loaded on \w+ in \d+ms\.', line)]
+        self.assertTrue(loaded_lines, 'expected a "loaded ... in Xms" line')
 
 
 if __name__ == '__main__':

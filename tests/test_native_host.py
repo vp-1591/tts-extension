@@ -98,3 +98,26 @@ class LogTailTests(unittest.TestCase):
             self.assertEqual(len(tail), 100)
         finally:
             tmp_path.unlink(missing_ok=True)
+
+
+class HostLogTests(unittest.TestCase):
+    def test_host_log_appends_timestamped_line(self):
+        import os
+        import tempfile
+        fd, name = tempfile.mkstemp(suffix='.log')
+        os.close(fd)
+        tmp_path = Path(name)
+        try:
+            with patch.object(tts_native_host, 'SPAWNER_LOG', tmp_path):
+                tts_native_host._host_log('x')
+
+            content = tmp_path.read_text(encoding='utf-8')
+            self.assertIn('[HOST] x', content)
+            self.assertRegex(content, r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[HOST\] x')
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_host_log_survives_oserror(self):
+        bad_path = Path('Z:/nonexistent-dir/log') if not Path('Z:').exists() else Path('X:/nope/log')
+        with patch.object(tts_native_host, 'SPAWNER_LOG', bad_path):
+            tts_native_host._host_log('x')  # must not raise
