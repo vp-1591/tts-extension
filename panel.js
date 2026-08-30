@@ -59,7 +59,7 @@ btnNewConv.addEventListener('click', async () => {
   }
 });
 
-const START_POLL_MS = 1500;
+const START_POLL_MS = 500;
 const START_TIMEOUT_MS = 90000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
