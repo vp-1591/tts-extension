@@ -63,4 +63,8 @@ mechanisms above remain unchanged — only which phase is measured where.
   import-dominated total; the panel still gates on `model_loaded`, so panel-perceived
   readiness is unaffected.
 - The 2026-08-30 baseline (imports 6.11 s, model load 5656 ms, total ~12 s) remains valid
-  as the PRE-change record. Post-change baseline: recorded in the PR for feat/startup-speedups.
+  as the PRE-change record. Post-change baseline (same day, warm cache, PR for
+  feat/startup-speedups): `Stdlib imports took 0.01s`; `Ready at ... (startup 0.01s)`;
+  `[PHASE] heavy imports took 5875ms` (matches the 5873 ms importtime profile); model load
+  2141 ms with `HF_HUB_OFFLINE=1`; `[PHASE] TTS warmup took 1125ms`;
+  `[PHASE] ollama ensure took 47ms` in parallel. Time to `model_loaded` ~8 s (was ~12 s).
