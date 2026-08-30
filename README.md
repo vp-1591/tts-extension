@@ -183,7 +183,8 @@ Environment variables:
 | `VISION_API_BASE` | `http://127.0.0.1:11434` | Ollama API URL |
 | `VISION_API_KEY` | `ollama` | API key |
 | `OLLAMA_STARTUP_TIMEOUT` | `15` | Seconds to wait for Ollama startup |
-| `TTS_SKIP_WARM` | `1` | Skip Kokoro warm-up |
+| `TTS_WARMUP` | `1` | Run a tiny warmup synthesis after model load (0 disables — skips CUDA kernel warm-up, first TTS chunk then costs 1.3-3.1s) |
+| `HF_OFFLINE_IF_CACHED` | `1` | Set `HF_HUB_OFFLINE=1` automatically when the Kokoro model is present in the local HF cache (0 always fetches; needed to download non-cached voices) |
 | `HEARTBEAT_GRACE` | `90` | Seconds of silence before a `--managed` server stops |
 
 ## Troubleshooting

@@ -41,3 +41,26 @@ No third-party library is adopted (loguru is already installed but has no timing
 - `tests/test_kokoro_server.py::StartupTimingTests` — `_boot()` emits `[BOOT]` with a date-stamped prefix; `_phase()` logs `[PHASE] <name> took Nms`, and `[PHASE] <name> failed after Nms` (no success shape) when the wrapped body raises; `get_pipeline()` logs `Kokoro model loaded on <device> in Nms` and sets `MODEL_LOADED`.
 - `tests/test_native_host.py::HostLogTests` — `_host_log()` appends a timestamped `[HOST]` line (and keeps the shared handle open when one exists) and survives `OSError`. `SpawnServerTests` asserts the child's `Popen` stdout is the module's `spawner_fp`, i.e. the same handle `_host_log()` writes through.
 - Manual: start `./.venv/Scripts/python.exe kokoro_server.py --managed` with no other server running; `logs/server.log` shows `Imports took X.XXs`, `[PHASE] socket bind took Xms`, `[PHASE] ollama ensure took Xms`, the model-load ms line, and `Ready at ... (startup X.XXs)`; an extension auto-start puts `[BOOT]` lines into `logs/server_spawner.log`.
+
+## Amendment (2026-08-30): observability after issue #6 deferral
+
+Issue #6 deferred its speedup work out of this ADR; this amendment records how the phase
+instrumentation moves once that work lands. All log-line formats, sinks, and the four
+mechanisms above remain unchanged — only which phase is measured where.
+
+- **Imports**: the heavy imports (`from kokoro import KPipeline` and friends) move from
+  module top into `get_pipeline()`, so `_boot('heavy imports done')` is removed and the
+  stderr `[BOOT]` pair shrinks to the start/stdlib marks. `[SERVER] Imports took` is renamed
+  to `[SERVER] Stdlib imports took` and now reports stdlib-only cost (~0.3s). The kokoro
+  import is timed inside `get_pipeline()` by a new `[PHASE] heavy imports took Xms` phase,
+  which also logs the `failed after Nms` shape — the crashed-import case the `_boot()`
+  markers existed for is now covered by `_phase()` semantics after all.
+- **New phases**: `[PHASE] ollama ensure` no longer runs on the model-loader thread; it
+  moves to its own `ollama-ensure` daemon thread parallel to model load. The model-loader
+  thread gains `[PHASE] TTS warmup took Xms` around the post-load warmup synthesis.
+- **`Ready at ... (startup X.XXs)`** is unchanged in format, but with the import cost off
+  the module path it now measures time-to-HTTP-ready (~0.3s) rather than the former
+  import-dominated total; the panel still gates on `model_loaded`, so panel-perceived
+  readiness is unaffected.
+- The 2026-08-30 baseline (imports 6.11 s, model load 5656 ms, total ~12 s) remains valid
+  as the PRE-change record. Post-change baseline: recorded in the PR for feat/startup-speedups.
