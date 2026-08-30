@@ -22,14 +22,48 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+# --- Boot timing ---
+# The native host redirects stderr to logs/server_spawner.log, so these lines
+# carry wall-clock timestamps for the import phase that runs before
+# setup_logging() configures the file handler. Manual runs see them on the TTY.
+_BOOT_START = time.monotonic()
+
+def _boot(msg: str) -> None:
+    print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} [BOOT] {msg}', file=sys.stderr, flush=True)
+
+@contextmanager
+def _phase(name: str):
+    """Log how long a startup phase took, in ms.
+
+    A failing phase logs 'failed after Nms' instead, so a crashed startup
+    never contributes a success-shaped 'took Nms' sample to the baseline.
+    """
+    t0 = time.monotonic()
+    try:
+        yield
+    except BaseException:
+        ms = int((time.monotonic() - t0) * 1000)
+        logging.info(f"[PHASE] {name} failed after {ms}ms")
+        raise
+    else:
+        ms = int((time.monotonic() - t0) * 1000)
+        logging.info(f"[PHASE] {name} took {ms}ms")
+
+_boot('stdlib imports done')
+
 os.environ.setdefault('TTS_SKIP_WARM', '1')
 
-import numpy as np
-import soundfile as sf
-from kokoro import KPipeline
+# Heavy imports sit after the boot markers on purpose so the [BOOT] stderr lines
+# bracket them in server_spawner.log; the env line above is ruff-allowed here.
+import numpy as np  # noqa: E402
+import soundfile as sf  # noqa: E402
+from kokoro import KPipeline  # noqa: E402
+
+_boot('heavy imports done')
 
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
@@ -191,9 +225,11 @@ def get_pipeline():
             for device in ('cuda', 'cpu'):
                 try:
                     logging.info(f"[SERVER] Loading Kokoro model on {device}...")
+                    t0 = time.monotonic()
                     pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device=device)
+                    model_load_ms = int((time.monotonic() - t0) * 1000)
                     MODEL_LOADED = True
-                    logging.info(f"[SERVER] Kokoro model loaded on {device}.")
+                    logging.info(f"[SERVER] Kokoro model loaded on {device} in {model_load_ms}ms.")
                     return pipeline
                 except Exception as e:
                     if device == 'cuda':
@@ -794,6 +830,7 @@ def main():
     MANAGED = args.managed
 
     setup_logging()
+    logging.info(f"[SERVER] Imports took {time.monotonic() - _BOOT_START:.2f}s")
     logging.info(f"[SERVER] Starting on {args.host}:{args.port} (managed={MANAGED})")
     ensure_conversation_dir()
 
@@ -810,8 +847,9 @@ def main():
     server = HTTPServer((args.host, args.port), TTSHandler, bind_and_activate=False)
     server.allow_reuse_address = False
     try:
-        server.server_bind()
-        server.server_activate()
+        with _phase('socket bind'):
+            server.server_bind()
+            server.server_activate()
     except OSError as e:
         logging.error(f"[SERVER] Could not bind {args.host}:{args.port} — is another kokoro_server already running? ({e})")
         raise SystemExit(1)
@@ -821,14 +859,17 @@ def main():
 
     def load_model():
         try:
-            ensure_ollama_running()
+            with _phase('ollama ensure'):
+                ensure_ollama_running()
             get_pipeline()  # pre-load model; sets MODEL_LOADED on success
         except Exception as e:
             logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.")
 
     threading.Thread(target=load_model, name='model-loader', daemon=True).start()
 
-    logging.info(f"[SERVER] Ready at http://{args.host}:{args.port}")
+    # Anchored at _BOOT_START so 'startup' spans the import phase too — the
+    # dominant cost (see issues #6-#10) — not just post-argparse bring-up.
+    logging.info(f"[SERVER] Ready at http://{args.host}:{args.port} (startup {time.monotonic() - _BOOT_START:.2f}s)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

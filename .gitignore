@@ -8,3 +8,4 @@ bmad-*/
 native_host/*.json
 native_host/*.bat
 .venv/
+extension-private-key.md
