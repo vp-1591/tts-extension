@@ -10,19 +10,19 @@ GET  /health     -> status
 
 import argparse
 import base64
-import ipaddress
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
-import sys
 import subprocess
+import sys
 import tempfile
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 os.environ.setdefault('TTS_SKIP_WARM', '1')
@@ -363,8 +363,8 @@ def ensure_ollama_running() -> None:
 
 def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: list | None = None):
     """Yield OCR text fragments from the Ollama native streaming API."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     b64 = base64.b64encode(image_bytes).decode('utf-8')
 
@@ -604,7 +604,6 @@ class TTSHandler(BaseHTTPRequestHandler):
             t0 = time.time()
             wav_bytes = text_to_wav(text, voice)
             elapsed = time.time() - t0
-            duration = len(wav_bytes) / (SAMPLE_RATE * 2)  # rough estimate
             tps = len(text) / elapsed if elapsed > 0 else 0
             logging.info(f"[TTS] {elapsed:.1f}s for {len(text)} chars, TPS: {tps:.1f} chars/s")
             touch_heartbeat()  # in-flight request; see touch_heartbeat
