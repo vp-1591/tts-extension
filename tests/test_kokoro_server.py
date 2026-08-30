@@ -17,13 +17,30 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+# Test doubles for the heavy deps, faithful to their real APIs:
+# - kokoro.pipeline.KPipeline.__call__ (pipeline.py:351-371) takes
+#   (text, voice=..., speed=1) and raises ValueError when voice is None;
+#   it yields objects iterable as (graphemes, phonemes, audio).
+# - soundfile.write(data, samplerate, **kwargs) is recorded but writes
+#   nothing, so the WAV buffer stays byte-inert (b'').
+PIPE_CALLS = []  # (text, voice) observed at the pipe boundary; reset per test
+SF_WRITES = []  # (data, samplerate, kwargs) from sf.write; reset per test
+
+
 class FakePipeline:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, lang_code, repo_id=None, model=True, device=None):
         pass
+
+    def __call__(self, text, voice=None, speed=1):
+        if voice is None:  # mirrors kokoro.pipeline.KPipeline.__call__
+            raise ValueError('Specify a voice')
+        PIPE_CALLS.append((text, voice))
+        return iter([('Hello.', 'hˈɛloʊ', [0.0, 0.1])])
 
 
 sys.modules.setdefault('numpy', types.SimpleNamespace(concatenate=lambda chunks: chunks))
-sys.modules.setdefault('soundfile', types.SimpleNamespace(write=lambda *args, **kwargs: None))
+sys.modules.setdefault('soundfile', types.SimpleNamespace(
+    write=lambda file, data, samplerate, **kwargs: SF_WRITES.append((data, samplerate, kwargs))))
 sys.modules.setdefault('kokoro', types.SimpleNamespace(KPipeline=FakePipeline))
 
 kokoro_server = importlib.import_module('kokoro_server')
@@ -36,6 +53,64 @@ class FlushableBytesIO(io.BytesIO):
 
     def flush(self):
         self.flush_count += 1
+
+
+class SingleVoiceTestBase(unittest.TestCase):
+    """Runs through the real get_pipeline() -> FakePipeline path (never mocks
+    get_pipeline/text_to_wav). _hf_cache_dir is pointed at an empty dir so
+    get_pipeline cannot read the warm machine's cache and flip HF_HUB_OFFLINE."""
+
+    def setUp(self):
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+        PIPE_CALLS.clear()
+        SF_WRITES.clear()
+        self._tmp = tempfile.mkdtemp()
+        patcher = patch.object(kokoro_server, '_hf_cache_dir', return_value=Path(self._tmp))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+
+    def tearDown(self):
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+
+    def make_handler(self):
+        # Same construction as ManagedLifetimeTests.make_handler: a bare
+        # handler instance around buffered streams.
+        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
+        handler.rfile = io.BytesIO(b'')
+        handler.wfile = FlushableBytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+
+class SingleVoiceTests(SingleVoiceTestBase):
+    """The server pins af_bella; a request-level voice must have no surface."""
+
+    def test_text_to_wav_uses_default_voice(self):
+        kokoro_server.text_to_wav('Hello.')
+
+        self.assertEqual(PIPE_CALLS, [('Hello.', 'af_bella')])
+        # numpy.concatenate returns its input, so the recorded data is the
+        # per-chunk audio list the pipeline yielded.
+        data, samplerate, kwargs = SF_WRITES[0]
+        self.assertEqual(data, [[0.0, 0.1]])
+        self.assertEqual(samplerate, kokoro_server.SAMPLE_RATE)
+        self.assertEqual(kwargs, {'format': 'WAV'})
+
+    def test_tts_handler_ignores_voice_field(self):
+        handler = self.make_handler()
+        body = json.dumps({'text': 'hi', 'voice': 'am_adam'}).encode()
+        handler.path = '/tts'
+        handler.headers = {'Content-Length': str(len(body))}
+        handler.rfile = io.BytesIO(body)
+
+        kokoro_server.TTSHandler.do_POST(handler)
+
+        self.assertEqual(PIPE_CALLS, [('hi', 'af_bella')])
 
 
 class KokoroServerTests(unittest.TestCase):
@@ -140,7 +215,7 @@ class OcrTtsStreamTests(unittest.TestCase):
         fragments = ['**Big heading**\n', '- first bullet 🎉\n', 'Plain tail.']
         with patch.object(kokoro_server, 'ocr_image_stream', return_value=iter(fragments)), \
              patch.object(kokoro_server, 'text_to_wav', return_value=b'RIFF'):
-            kokoro_server.TTSHandler.handle_ocr_tts(handler, {'image': 'aW1n', 'voice': 'af_bella'})
+            kokoro_server.TTSHandler.handle_ocr_tts(handler, {'image': 'aW1n'})
 
         events = [json.loads(line) for line in handler.wfile.getvalue().decode('utf-8').splitlines() if line]
         texts = [e['text'] for e in events if e['type'] == 'text']
@@ -416,7 +491,7 @@ class StartupTimingTests(unittest.TestCase):
         self.assertTrue(loaded_lines, 'expected a "loaded ... in Xms" line')
 
 
-class DeferredHeavyImportsTests(unittest.TestCase):
+class DeferredHeavyImportsTests(SingleVoiceTestBase):
     """Issue #6: numpy/soundfile/kokoro must not be imported at module level."""
 
     def test_module_has_no_heavy_import_attributes(self):
@@ -425,12 +500,12 @@ class DeferredHeavyImportsTests(unittest.TestCase):
                              f"'{attr}' should be deferred, not a module attribute")
 
     def test_text_to_wav_works_with_deferred_imports(self):
-        pipe = MagicMock()
-        pipe.return_value = iter([(None, None, 'chunk')])
-        with patch.object(kokoro_server, 'get_pipeline', return_value=pipe):
-            wav = kokoro_server.text_to_wav('Hello.')
+        # The function-level imports must bind to the stub modules through the
+        # full real path, not a mocked get_pipeline.
+        kokoro_server.text_to_wav('Hello.')
 
-        self.assertEqual(wav, b'')
+        self.assertEqual(PIPE_CALLS, [('Hello.', 'af_bella')])
+        self.assertEqual(len(SF_WRITES), 1)
 
 
 class HfOfflineGatingTests(unittest.TestCase):
@@ -564,7 +639,8 @@ class TtsWarmupTests(unittest.TestCase):
              self.assertLogs(level='INFO') as logs:
             kokoro_server.load_model()
 
-        tts.assert_called_once_with('Hello.', kokoro_server.DEFAULT_VOICE)
+        # The voice is pinned inside text_to_wav, so warmup passes text only.
+        tts.assert_called_once_with('Hello.')
         self.assertTrue(any('[PHASE] TTS warmup took' in line for line in logs.output))
 
     def test_load_model_skips_warmup_when_disabled(self):

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Kokoro TTS + Vision OCR HTTP server for the Chrome extension.
 
-POST /tts       { "text": "...", "voice": "af_bella" }  -> audio/wav
+POST /tts       { "text": "..." }                        -> audio/wav
 POST /ocr_tts   { "image": "<base64_png>" }              -> NDJSON text/audio stream
 POST /panel-heartbeat  (empty body)                      -> liveness ping
-GET  /voices     -> list of voices
 GET  /health     -> status
 """
 
@@ -584,15 +583,16 @@ def pop_tts_segment(buffer: str, force: bool = False) -> tuple[str | None, str]:
     return (segment or None), remainder
 
 
-def text_to_wav(text: str, voice: str = DEFAULT_VOICE, _retry: bool = True) -> bytes:
-    """Generate TTS audio and return WAV bytes. Retries once on CUDA errors."""
+def text_to_wav(text: str, _retry: bool = True) -> bytes:
+    """Generate TTS audio with the pinned voice and return WAV bytes.
+    Retries once on CUDA errors."""
     import numpy as np
     import soundfile as sf
 
     pipe = get_pipeline()
     try:
         all_audio = []
-        for gs, ps, audio in pipe(text, voice=voice):
+        for gs, ps, audio in pipe(text, voice=DEFAULT_VOICE):
             all_audio.append(audio)
 
         if not all_audio:
@@ -606,7 +606,7 @@ def text_to_wav(text: str, voice: str = DEFAULT_VOICE, _retry: bool = True) -> b
         if _retry and is_cuda_error(e):
             logging.warning(f"[TTS] CUDA error, resetting pipeline and retrying: {e}")
             reset_pipeline()
-            return text_to_wav(text, voice=voice, _retry=False)
+            return text_to_wav(text, _retry=False)
         raise
 
 
@@ -615,13 +615,6 @@ class TTSHandler(BaseHTTPRequestHandler):
         if self.path == '/health':
             self.send_json({'status': 'ok', 'model': 'kokoro-82M', 'vision': VISION_MODEL,
                             'streaming': True, 'model_loaded': MODEL_LOADED, 'managed': MANAGED})
-        elif self.path == '/voices':
-            self.send_json({'voices': [
-                'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
-                'am_adam', 'am_michael',
-                'bf_emma', 'bf_isabella',
-                'bm_george', 'bm_lewis',
-            ]})
         elif self.path == '/conversation_state':
             self.handle_conversation_state()
         else:
@@ -655,7 +648,6 @@ class TTSHandler(BaseHTTPRequestHandler):
 
     def handle_tts(self, data):
         text = data.get('text', '').strip()
-        voice = data.get('voice', DEFAULT_VOICE)
         if not text:
             self.send_error(400, 'No text provided')
             return
@@ -664,7 +656,7 @@ class TTSHandler(BaseHTTPRequestHandler):
 
         try:
             t0 = time.time()
-            wav_bytes = text_to_wav(text, voice)
+            wav_bytes = text_to_wav(text)
             elapsed = time.time() - t0
             tps = len(text) / elapsed if elapsed > 0 else 0
             logging.info(f"[TTS] {elapsed:.1f}s for {len(text)} chars, TPS: {tps:.1f} chars/s")
@@ -677,7 +669,6 @@ class TTSHandler(BaseHTTPRequestHandler):
     def handle_ocr_tts(self, data):
         """Screenshot -> streaming OCR -> segmented TTS pipeline."""
         image_b64 = data.get('image', '')
-        voice = data.get('voice', DEFAULT_VOICE)
         constraints = data.get('constraints', '').strip()
         history_enabled = data.get('history', False)
         conversation_id = data.get('conversation_id', '')
@@ -734,7 +725,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                     self.send_stream_event({'type': 'text', 'text': segment})
                     try:
                         tts_start = time.time()
-                        wav_bytes = text_to_wav(segment, voice)
+                        wav_bytes = text_to_wav(segment)
                         audio_chunks += 1
                         audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
                         self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
@@ -754,7 +745,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                 self.send_stream_event({'type': 'text', 'text': segment})
                 try:
                     tts_start = time.time()
-                    wav_bytes = text_to_wav(segment, voice)
+                    wav_bytes = text_to_wav(segment)
                     audio_chunks += 1
                     audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
                     self.send_stream_event({'type': 'audio', 'text': segment, 'audio': audio_b64})
@@ -854,7 +845,7 @@ def load_model():
         if TTS_WARMUP:
             try:
                 with _phase('TTS warmup'):
-                    text_to_wav('Hello.', DEFAULT_VOICE)
+                    text_to_wav('Hello.')
             except Exception as e:
                 logging.warning(f"[SERVER] TTS warmup failed ({e}); skipping.")
     except Exception as e:

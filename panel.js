@@ -7,7 +7,6 @@ let playing = false;
 
 const btnRead = document.getElementById('btn-read');
 const statusEl = document.getElementById('status');
-const voiceSelect = document.getElementById('voice');
 const constraintsEl = document.getElementById('constraints');
 const ocrTextEl = document.getElementById('ocr-text');
 const errorEl = document.getElementById('error');
@@ -16,12 +15,6 @@ const btnNewConv = document.getElementById('btn-new-conv');
 const convIndicator = document.getElementById('conv-indicator');
 
 // Restore saved preferences
-const savedVoice = localStorage.getItem('tts-voice');
-if (savedVoice) voiceSelect.value = savedVoice;
-voiceSelect.addEventListener('change', () => {
-  localStorage.setItem('tts-voice', voiceSelect.value);
-});
-
 const savedConstraints = localStorage.getItem('tts-constraints');
 if (savedConstraints) constraintsEl.value = savedConstraints;
 constraintsEl.addEventListener('input', () => {
@@ -200,7 +193,7 @@ btnRead.addEventListener('click', async () => {
   // 3. Send to server: screenshot -> OCR -> TTS
   try {
     // Build request payload with optional constraints
-    const payload = { image: base64, voice: voiceSelect.value };
+    const payload = { image: base64 };
     const constraints = constraintsEl.value.trim();
     if (constraints) {
       payload.constraints = constraints;
