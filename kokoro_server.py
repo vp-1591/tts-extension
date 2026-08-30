@@ -845,6 +845,35 @@ class TTSHandler(BaseHTTPRequestHandler):
         pass
 
 
+def load_model():
+    try:
+        get_pipeline()  # pre-load model; sets MODEL_LOADED on success
+        # Warmup is failure-tolerant on its own: a broken warmup must not be
+        # reported as a model-load failure, the real model load already
+        # succeeded above.
+        if TTS_WARMUP:
+            try:
+                with _phase('TTS warmup'):
+                    text_to_wav('Hello.', DEFAULT_VOICE)
+            except Exception as e:
+                logging.warning(f"[SERVER] TTS warmup failed ({e}); skipping.")
+    except Exception as e:
+        logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.")
+
+
+def ensure_ollama():
+    with _phase('ollama ensure'):
+        ensure_ollama_running()
+
+
+def start_background_tasks():
+    # Ollama bring-up and the Kokoro model load are independent (the model
+    # loads from the HF cache, not from Ollama), so they race instead of
+    # serializing behind each other.
+    threading.Thread(target=load_model, name='model-loader', daemon=True).start()
+    threading.Thread(target=ensure_ollama, name='ollama-ensure', daemon=True).start()
+
+
 def main():
     global MANAGED
     parser = argparse.ArgumentParser(description='Kokoro TTS + Vision OCR server')
@@ -883,15 +912,7 @@ def main():
     touch_heartbeat()  # start the grace period now; the panel takes over once online
     maybe_start_watchdog(server)
 
-    def load_model():
-        try:
-            with _phase('ollama ensure'):
-                ensure_ollama_running()
-            get_pipeline()  # pre-load model; sets MODEL_LOADED on success
-        except Exception as e:
-            logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.")
-
-    threading.Thread(target=load_model, name='model-loader', daemon=True).start()
+    start_background_tasks()
 
     # Anchored at _BOOT_START so 'startup' spans the import phase too — the
     # dominant cost (see issues #6-#10) — not just post-argparse bring-up.

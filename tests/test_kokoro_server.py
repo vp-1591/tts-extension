@@ -513,5 +513,77 @@ class HfOfflineGatingTests(unittest.TestCase):
         self.assertNotIn('HF_HUB_OFFLINE', os.environ)
 
 
+class BackgroundTasksTests(unittest.TestCase):
+    """Issue #7: ollama bring-up must not serialize behind the Kokoro model load."""
+
+    def test_start_background_tasks_starts_two_threads(self):
+        threads = []
+        def fake_thread(**kw):
+            # A bare namespace, not a MagicMock: 'name' is reserved on mocks
+            # and kwargs are not exposed via __getitem__.
+            ns = types.SimpleNamespace(start=MagicMock(), **kw)
+            threads.append(ns)
+            return ns
+        with patch.object(kokoro_server.threading, 'Thread', side_effect=fake_thread):
+            kokoro_server.start_background_tasks()
+
+        self.assertEqual(len(threads), 2)
+        loader, ollama = threads
+        self.assertEqual(loader.target, kokoro_server.load_model)
+        self.assertEqual(loader.name, 'model-loader')
+        self.assertTrue(loader.daemon)
+        self.assertEqual(ollama.target, kokoro_server.ensure_ollama)
+        self.assertEqual(ollama.name, 'ollama-ensure')
+        self.assertTrue(ollama.daemon)
+
+    def test_ensure_ollama_runs_phase(self):
+        with patch.object(kokoro_server, 'ensure_ollama_running') as run:
+            with self.assertLogs(level='INFO') as logs:
+                kokoro_server.ensure_ollama()
+
+        run.assert_called_once_with()
+        self.assertTrue(any('[PHASE] ollama ensure took' in line for line in logs.output))
+
+
+class TtsWarmupTests(unittest.TestCase):
+    """Issue #8: exercise the model with a throwaway request right after load."""
+
+    def setUp(self):
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+        self._warmup = kokoro_server.TTS_WARMUP
+
+    def tearDown(self):
+        kokoro_server.TTS_WARMUP = self._warmup
+        kokoro_server.pipeline = None
+        kokoro_server.MODEL_LOADED = False
+
+    def test_load_model_warms_up_when_enabled(self):
+        with patch.object(kokoro_server, 'get_pipeline'), \
+             patch.object(kokoro_server, 'text_to_wav') as tts, \
+             self.assertLogs(level='INFO') as logs:
+            kokoro_server.load_model()
+
+        tts.assert_called_once_with('Hello.', kokoro_server.DEFAULT_VOICE)
+        self.assertTrue(any('[PHASE] TTS warmup took' in line for line in logs.output))
+
+    def test_load_model_skips_warmup_when_disabled(self):
+        kokoro_server.TTS_WARMUP = False
+        with patch.object(kokoro_server, 'get_pipeline'), \
+             patch.object(kokoro_server, 'text_to_wav') as tts:
+            kokoro_server.load_model()
+
+        tts.assert_not_called()
+
+    def test_load_model_survives_warmup_failure(self):
+        with patch.object(kokoro_server, 'get_pipeline'), \
+             patch.object(kokoro_server, 'text_to_wav', side_effect=RuntimeError('boom')), \
+             self.assertLogs(level='INFO') as logs:
+            kokoro_server.load_model()  # must not raise
+
+        self.assertTrue(any('TTS warmup failed' in line for line in logs.output))
+        self.assertFalse(any('Model load failed' in line for line in logs.output))
+
+
 if __name__ == '__main__':
     unittest.main()
