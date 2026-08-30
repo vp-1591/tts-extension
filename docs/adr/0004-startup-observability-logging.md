@@ -14,7 +14,7 @@ The goal is a measurable baseline of every startup phase so that speedup work (t
 
 Measure startup with the standard library only, using four deliberately separate mechanisms, each matched to its sink:
 
-- **`_boot()` stderr markers** (`[BOOT] <ts> <msg>` at module top, before and after the heavy imports) for the pre-logging import phase; the native host's stderr redirect gives these timestamps in `server_spawner.log`, and the last marker shows how far a crashing import got.
+- **`_boot()` stderr markers** (`[BOOT] <ts> <msg>` at module top) for the pre-logging stdlib imports; the native host's stderr redirect gives these timestamps in `server_spawner.log`. (The heavy imports later moved into `get_pipeline()` — see the amendment — so the markers no longer bracket them; a crashed import there is instead caught by the `[PHASE] heavy imports` `failed after Nms` shape.)
 - **`_phase()` context manager** (`[PHASE] <name> took <ms>ms`) for phases timed after `setup_logging()`: socket bind, Ollama ensure. A phase whose body raises logs `[PHASE] <name> failed after Nms` instead, so a crashed startup never contributes a success-shaped sample to the baseline.
 - **Inline `time.monotonic()`** where the log line is device-specific or totals a span: model load in `get_pipeline()` (`loaded ... in Xms`), total startup in `main()`'s `Ready at ... (startup X.XXs)` — anchored at `_BOOT_START`, since the import phase dominates the total and a post-`main()` anchor would read ~0.02 s forever.
 - **`_host_log()` in the native host** (`[HOST] <ts> ...`) appending to `server_spawner.log`, so the host's spawn/ready/failed timeline lives in the same file as the child's stderr. Guarded with `except OSError`, writing before `spawn_server()` so the child cannot precede the spawn entry. Both the host lines and the child's stdout/stderr go through **one shared file handle** (`spawner_fp`, opened by `spawn_server()` and inherited by the child): the CRT append flag of a mode-`'ab'` open does not survive process inheritance, so a second, separate open would let the child write at its own stale file offset and silently overwrite the `[HOST]` lines appended past it.
@@ -40,13 +40,14 @@ No third-party library is adopted (loguru is already installed but has no timing
 
 - `tests/test_kokoro_server.py::StartupTimingTests` — `_boot()` emits `[BOOT]` with a date-stamped prefix; `_phase()` logs `[PHASE] <name> took Nms`, and `[PHASE] <name> failed after Nms` (no success shape) when the wrapped body raises; `get_pipeline()` logs `Kokoro model loaded on <device> in Nms` and sets `MODEL_LOADED`.
 - `tests/test_native_host.py::HostLogTests` — `_host_log()` appends a timestamped `[HOST]` line (and keeps the shared handle open when one exists) and survives `OSError`. `SpawnServerTests` asserts the child's `Popen` stdout is the module's `spawner_fp`, i.e. the same handle `_host_log()` writes through.
-- Manual: start `./.venv/Scripts/python.exe kokoro_server.py --managed` with no other server running; `logs/server.log` shows `Imports took X.XXs`, `[PHASE] socket bind took Xms`, `[PHASE] ollama ensure took Xms`, the model-load ms line, and `Ready at ... (startup X.XXs)`; an extension auto-start puts `[BOOT]` lines into `logs/server_spawner.log`.
+- Manual: start `./.venv/Scripts/python.exe kokoro_server.py --managed` with no other server running; `logs/server.log` shows `Stdlib imports took X.XXs`, `[PHASE] socket bind took Xms`, `[PHASE] ollama ensure took Xms`, the model-load ms line, and `Ready at ... (startup X.XXs)`; an extension auto-start puts `[BOOT]` lines into `logs/server_spawner.log`.
 
 ## Amendment (2026-08-30): observability after issue #6 deferral
 
 Issue #6 deferred its speedup work out of this ADR; this amendment records how the phase
-instrumentation moves once that work lands. All log-line formats, sinks, and the four
-mechanisms above remain unchanged — only which phase is measured where.
+instrumentation moves once that work lands. The four mechanisms, sinks, and log-line formats
+above remain unchanged, except for one rename (`Imports took` → `Stdlib imports took`, below);
+only which phase is measured where changes.
 
 - **Imports**: the heavy imports (`from kokoro import KPipeline` and friends) move from
   module top into `get_pipeline()`, so `_boot('heavy imports done')` is removed and the
@@ -56,8 +57,12 @@ mechanisms above remain unchanged — only which phase is measured where.
   which also logs the `failed after Nms` shape — the crashed-import case the `_boot()`
   markers existed for is now covered by `_phase()` semantics after all.
 - **New phases**: `[PHASE] ollama ensure` no longer runs on the model-loader thread; it
-  moves to its own `ollama-ensure` daemon thread parallel to model load. The model-loader
-  thread gains `[PHASE] TTS warmup took Xms` around the post-load warmup synthesis.
+  moves to its own `ollama-ensure` daemon thread parallel to model load. `[PHASE] TTS warmup
+  took Xms` brackets the post-load warmup synthesis, run inside `get_pipeline()` under
+  `pipeline_lock` after `MODEL_LOADED = True` — on the loader thread at startup, and on the
+  request thread after a CUDA-error-triggered reload. numpy/soundfile are probed during the
+  heavy-imports phase, so a broken dependency fails model load (panel stays offline) rather
+  than degrading silently.
 - **`Ready at ... (startup X.XXs)`** is unchanged in format, but with the import cost off
   the module path it now measures time-to-HTTP-ready (~0.3s) rather than the former
   import-dominated total; the panel still gates on `model_loaded`, so panel-perceived

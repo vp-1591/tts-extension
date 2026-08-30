@@ -9,6 +9,7 @@ GET  /health     -> status
 
 import argparse
 import base64
+import importlib
 import io
 import ipaddress
 import json
@@ -56,6 +57,7 @@ _boot('stdlib imports done')
 
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
+MODEL_REPO_ID = 'hexgrad/Kokoro-82M'
 
 # --- Logging ---
 LOGS_DIR = Path(__file__).parent / 'logs'
@@ -210,19 +212,31 @@ def save_turn(conv_id: str, image_bytes: bytes, prompt: str, ocr_text: str) -> N
 
 
 def _hf_cache_dir() -> Path:
-    """Resolve the HuggingFace hub cache directory the same way huggingface_hub does."""
+    """Resolve the HuggingFace hub cache directory exactly like
+    huggingface_hub.constants, so the cache-warm check below agrees with where
+    the import actually looks. Each level expands vars/user as the real code
+    does, including the legacy HUGGINGFACE_HUB_CACHE name."""
     if os.environ.get('HF_HUB_CACHE'):
-        return Path(os.environ['HF_HUB_CACHE'])
+        return Path(os.path.expandvars(os.path.expanduser(os.environ['HF_HUB_CACHE'])))
+    if os.environ.get('HUGGINGFACE_HUB_CACHE'):
+        return Path(os.path.expandvars(os.path.expanduser(os.environ['HUGGINGFACE_HUB_CACHE'])))
     if os.environ.get('HF_HOME'):
-        return Path(os.environ['HF_HOME']) / 'hub'
-    return Path.home() / '.cache' / 'huggingface' / 'hub'
+        hf_home = Path(os.path.expandvars(os.path.expanduser(os.environ['HF_HOME'])))
+    else:
+        xdg = os.environ.get('XDG_CACHE_HOME')
+        if xdg:
+            hf_home = Path(os.path.expandvars(os.path.expanduser(xdg))) / 'huggingface'
+        else:
+            hf_home = Path(os.path.expanduser('~/.cache')) / 'huggingface'
+    return hf_home / 'hub'
 
 
 def _kokoro_model_cached() -> bool:
     """True when the Kokoro weights are already in the local HF cache, so no
     network round-trip is needed and HF_HUB_OFFLINE can be set safely."""
     try:
-        snapshots = _hf_cache_dir() / 'models--hexgrad--Kokoro-82M' / 'snapshots'
+        slug = f'models--{MODEL_REPO_ID.replace("/", "--")}'
+        snapshots = _hf_cache_dir() / slug / 'snapshots'
         return any(
             (d / 'config.json').is_file() and (d / 'kokoro-v1_0.pth').is_file()
             for d in snapshots.iterdir() if d.is_dir()
@@ -244,14 +258,31 @@ def get_pipeline():
                     os.environ['HF_HUB_OFFLINE'] = '1'
                     logging.info("[SERVER] HF cache warm; HF_HUB_OFFLINE=1")
                 from kokoro import KPipeline
+                # A broken numpy/soundfile must fail model load (MODEL_LOADED
+                # stays false) instead of being swallowed by the warmup and
+                # turning every /tts into a 500. importlib avoids an unused
+                # ruff import; text_to_wav keeps its own imports for names.
+                importlib.import_module('numpy')
+                importlib.import_module('soundfile')
             for device in ('cuda', 'cpu'):
                 try:
                     logging.info(f"[SERVER] Loading Kokoro model on {device}...")
                     t0 = time.monotonic()
-                    pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M', device=device)
+                    pipeline = KPipeline(lang_code='a', repo_id=MODEL_REPO_ID, device=device)
                     model_load_ms = int((time.monotonic() - t0) * 1000)
                     MODEL_LOADED = True
                     logging.info(f"[SERVER] Kokoro model loaded on {device} in {model_load_ms}ms.")
+                    # Warmup lives here, under pipeline_lock, so it cannot
+                    # race a real first request into a half-initialized pipe.
+                    # Direct synthesis, not text_to_wav: that would re-enter
+                    # get_pipeline and deadlock on the non-reentrant lock.
+                    if TTS_WARMUP:
+                        try:
+                            with _phase('TTS warmup'):
+                                for _ in pipeline('Hello.', voice=DEFAULT_VOICE):
+                                    pass
+                        except Exception as e:
+                            logging.warning(f"[SERVER] TTS warmup failed ({e}); skipping.")
                     return pipeline
                 except Exception as e:
                     if device == 'cuda':
@@ -839,17 +870,11 @@ class TTSHandler(BaseHTTPRequestHandler):
 def load_model():
     try:
         get_pipeline()  # pre-load model; sets MODEL_LOADED on success
-        # Warmup is failure-tolerant on its own: a broken warmup must not be
-        # reported as a model-load failure, the real model load already
-        # succeeded above.
-        if TTS_WARMUP:
-            try:
-                with _phase('TTS warmup'):
-                    text_to_wav('Hello.')
-            except Exception as e:
-                logging.warning(f"[SERVER] TTS warmup failed ({e}); skipping.")
     except Exception as e:
-        logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.")
+        # exc_info keeps the loader-thread traceback in logs/server.log; without
+        # it a broken dependency fails with a one-line message and no cause.
+        logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.",
+                      exc_info=True)
 
 
 def ensure_ollama():
