@@ -11,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,12 +39,26 @@ class FakePipeline:
         return iter([('Hello.', 'hˈɛloʊ', [0.0, 0.1])])
 
 
-sys.modules.setdefault('numpy', types.SimpleNamespace(concatenate=lambda chunks: chunks))
-sys.modules.setdefault('soundfile', types.SimpleNamespace(
-    write=lambda file, data, samplerate, **kwargs: SF_WRITES.append((data, samplerate, kwargs))))
-sys.modules.setdefault('kokoro', types.SimpleNamespace(KPipeline=FakePipeline))
+class ModuleStub(types.ModuleType):
+    """Module subclass so tests can inject attributes with pyright quiet:
+    SimpleNamespace is not assignable to ModuleType in sys.modules, and plain
+    ModuleType instances reject unknown attributes to the type checker."""
 
-kokoro_server = importlib.import_module('kokoro_server')
+
+def _stub(name: str, **attrs) -> types.ModuleType:
+    mod = ModuleStub(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
+
+
+sys.modules.setdefault('numpy', _stub('numpy', concatenate=lambda chunks: chunks))
+sys.modules.setdefault('soundfile', _stub('soundfile', write=lambda file, data, samplerate, **kwargs: SF_WRITES.append((data, samplerate, kwargs))))
+sys.modules.setdefault('kokoro', _stub('kokoro', KPipeline=FakePipeline))
+
+# Modules loaded dynamically and mutated per-test; Any tells pyright these
+# module objects accept attribute injection.
+kokoro_server: Any = importlib.import_module('kokoro_server')
 
 
 class FlushableBytesIO(io.BytesIO):
