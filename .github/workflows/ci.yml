@@ -10,19 +10,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.12'
+          enable-cache: true
 
+      # Torch-free install: tests stub torch; skips the multi-GB CUDA wheel.
+      # --locked fails if uv.lock does not match pyproject.toml.
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install kokoro soundfile ruff pytest
+        run: uv sync --locked --no-install-package torch
 
       - name: Lint (ruff)
-        run: ruff check kokoro_server.py native_host/ tests/
+        run: uv run --no-sync ruff check kokoro_server.py native_host/ tests/
 
       - name: Run tests
         env:
           PYTHONDONTWRITEBYTECODE: 1
-        run: pytest tests/ -v --ignore=tests/e2e
+        run: uv run --no-sync pytest tests/ -v
