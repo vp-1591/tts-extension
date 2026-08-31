@@ -891,16 +891,95 @@ class BackgroundTasksTests(unittest.TestCase):
 
     def test_ensure_ollama_running_marks_unavailable_on_startup_timeout(self):
         # Ollama spawned but never answered within the bounded budget: a
-        # terminal 'unavailable', not an eternal 'starting'.
+        # terminal 'unavailable', not an eternal 'starting'. REPROBE is zeroed
+        # so the now-spawned late-probe thread expires with zero probes
+        # instead of leaking a 60 s probe at the real loopback into the run.
         proc = MagicMock()
         proc.poll.return_value = None
         with patch.object(kokoro_server, '_ollama_is_running', return_value=False), \
              patch.object(kokoro_server.shutil, 'which', return_value='C:/ollama.exe'), \
              patch.object(kokoro_server.subprocess, 'Popen', return_value=proc), \
-             patch.object(kokoro_server, 'OLLAMA_STARTUP_TIMEOUT', 0):
+             patch.object(kokoro_server, 'OLLAMA_STARTUP_TIMEOUT', 0), \
+             patch.object(kokoro_server, 'OLLAMA_REPROBE_TIMEOUT', 0):
             kokoro_server.ensure_ollama_running()
 
         self.assertEqual(kokoro_server.OLLAMA_STATE, 'unavailable')
+
+
+class OllamaLateProbeTests(unittest.TestCase):
+    """_ollama_late_probe upgrades 'unavailable' -> 'ready' only, within a
+    bounded budget, on its own thread."""
+
+    def setUp(self):
+        # BackgroundTasksTests-style state babysitting: earlier tests in this
+        # run leave OLLAMA_STATE='unavailable'. Direct module-attribute writes
+        # mirror that class (pyright flags them; accepted pattern here).
+        self._ollama_state = kokoro_server.OLLAMA_STATE
+        self._reprobe = kokoro_server.OLLAMA_REPROBE_TIMEOUT
+        self.set_state('unavailable')
+
+    def tearDown(self):
+        self.set_state(self._ollama_state)
+        self.set_reprobe(self._reprobe)
+
+    @staticmethod
+    def set_state(value):
+        setattr(kokoro_server, 'OLLAMA_STATE', value)
+
+    @staticmethod
+    def set_reprobe(value):
+        setattr(kokoro_server, 'OLLAMA_REPROBE_TIMEOUT', value)
+
+    def test_late_probe_flips_unavailable_to_ready(self):
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=True), \
+             patch.object(kokoro_server, 'OLLAMA_REPROBE_TIMEOUT', 1), \
+             self.assertLogs(level='INFO') as logs:
+            kokoro_server._ollama_late_probe(['http://127.0.0.1:11434'])
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'ready')
+        self.assertTrue(any('Late probe: ready' in line for line in logs.output))
+
+    def test_late_probe_leaves_unavailable_when_horizon_expires(self):
+        # Zero horizon must zero-iterate (probe-before-sleep loop shape), so no
+        # probe ever runs and the state stays 'unavailable'.
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=False) as probe, \
+             patch.object(kokoro_server, 'OLLAMA_REPROBE_TIMEOUT', 0), \
+             self.assertLogs(level='WARNING') as logs:
+            kokoro_server._ollama_late_probe(['http://127.0.0.1:11434'])
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'unavailable')
+        probe.assert_not_called()
+        self.assertTrue(any('Late probe: still not responding' in line for line in logs.output))
+
+    def test_late_probe_never_downgrades_ready(self):
+        # The guard short-circuits before any probe: if another writer already
+        # flipped the state to 'ready', the probe returns without re-writing
+        # (or re-logging) the upgrade.
+        self.set_state('ready')
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=True) as probe, \
+             patch.object(kokoro_server, 'OLLAMA_REPROBE_TIMEOUT', 1):
+            kokoro_server._ollama_late_probe(['http://127.0.0.1:11434'])
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'ready')
+        probe.assert_not_called()
+
+    def test_timeout_spawns_late_probe_thread(self):
+        # The spawn site lives in ensure_ollama_running's timeout branch; the
+        # ctor args pin the target and thread name. Thread is fully mocked, so
+        # nothing real is spawned.
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=False), \
+             patch.object(kokoro_server.shutil, 'which', return_value='C:/ollama.exe'), \
+             patch.object(kokoro_server.subprocess, 'Popen', return_value=proc), \
+             patch.object(kokoro_server, 'OLLAMA_STARTUP_TIMEOUT', 0), \
+             patch('kokoro_server.threading.Thread') as thread_ctor:
+            kokoro_server.ensure_ollama_running()
+
+        (ctor,) = thread_ctor.call_args_list
+        self.assertIs(ctor.kwargs['target'], kokoro_server._ollama_late_probe)
+        self.assertEqual(ctor.kwargs['name'], 'ollama-late-probe')
+        self.assertTrue(ctor.kwargs['daemon'])
 
 
 class BrokenPipeline:
@@ -956,6 +1035,9 @@ class TtsWarmupTests(SingleVoiceTestBase):
         self.assertIsNone(kokoro_server.pipeline)
         self.assertTrue(any('[PHASE] TTS warmup failed' in line for line in logs.output))
         self.assertTrue(any('falling back to CPU' in line for line in logs.output))
+        # The success-shaped 'loaded on cuda' line must not precede a warmup
+        # failure: it now emits only after the warmup validated the device.
+        self.assertFalse(any('Kokoro model loaded on cuda' in line for line in logs.output))
 
 
 if __name__ == '__main__':

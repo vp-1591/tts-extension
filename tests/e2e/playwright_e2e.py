@@ -1,14 +1,16 @@
 """End-to-end test of the extension's auto-start / auto-revive flow via Playwright.
 
-Runs against Playwright's bundled Chromium: branded Chrome >=137 ignores
---load-extension and hides automation-installed extensions from normal tab
-navigation, while Chromium's classic --load-extension path exposes the
-extension (service worker + chrome-extension:// pages) exactly like a manual
-"Load unpacked" does.
+Runs headless against Playwright's bundled Chromium (new headless via
+channel='chromium' only — the old headless shell ignores --load-extension):
+branded Chrome >=137 ignores --load-extension and hides automation-installed
+extensions from normal tab navigation, while Chromium's classic
+--load-extension path exposes the extension (service worker +
+chrome-extension:// pages) exactly like a manual "Load unpacked" does.
 
 Stages (each prints PASS/FAIL):
   1. preconditions: server offline; Chromium resolves host manifest via registry
   2. open panel.html as a tab with the server stopped -> panel reaches 'Server online'
+  2.5 mock /health ollama states -> heartbeat repaints the OCR label without a click
   3. kill the server process -> panel flips offline (3-strike heartbeat) -> auto-revive
 
 Run:  PYTHONDONTWRITEBYTECODE=1 python tests/e2e/playwright_e2e.py
@@ -114,7 +116,8 @@ def main():
 
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(REPO / 'tmp' / 'pw-profile-chromium'),
-            headless=False,
+            headless=True,
+            channel='chromium',
             ignore_default_args=['--disable-extensions'],
             args=[
                 f'--disable-extensions-except={ext_dir}',
@@ -150,6 +153,50 @@ def main():
                       json.dumps(health))
             except Exception as e:
                 check('server /health after auto-start', False, repr(e))
+
+            # Stage 2.5: OCR label repaint driven by the heartbeat loop. /health
+            # is mocked deterministically so the test doesn't depend on real
+            # Ollama timing: first 'warming up', then 'ready' — the label must
+            # follow without any click (Fix: heartbeat label repaint).
+            health_state = {'ollama': 'starting'}
+
+            def health_route(route):
+                import json
+                body = {'status': 'ok', 'model': 'kokoro-82M', 'vision': 'mock',
+                        'streaming': True, 'model_loaded': True, 'managed': True,
+                        'ollama': health_state['ollama']}
+                route.fulfill(status=200, content_type='application/json',
+                              body=json.dumps(body))
+
+            panel.route('**/health', health_route)
+
+            def wait_for_label(fragment, timeout_s=75):
+                # One heartbeat interval (15 s) plus slack per state flip.
+                deadline = time.monotonic() + timeout_s
+                last = ''
+                while time.monotonic() < deadline:
+                    try:
+                        cur = panel.locator(STATUS_SELECTOR).inner_text(timeout=2000)
+                    except Exception:
+                        cur = '<page error>'
+                    if cur != last:
+                        print(f'    [{time.strftime("%H:%M:%S")}] status: {cur.strip()!r}')
+                        last = cur
+                    if fragment in last:
+                        return last
+                    time.sleep(1)
+                return last
+
+            try:
+                got = wait_for_label('OCR warming up')
+                check('OCR label shows warming up (mocked starting)',
+                      'OCR warming up' in got, got.strip())
+                health_state['ollama'] = 'ready'
+                got = wait_for_label('OCR ready')
+                check('OCR label repaints to ready without a click',
+                      'OCR ready' in got, got.strip())
+            finally:
+                panel.unroute('**/health')
 
             # Stage 3: kill server -> 3-strike offline -> auto-revive
             import subprocess

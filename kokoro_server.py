@@ -96,6 +96,10 @@ VISION_MODEL = os.environ.get('VISION_MODEL', 'gemma4:31b:cloud')
 VISION_API_BASE = os.environ.get('VISION_API_BASE', 'http://127.0.0.1:11434')
 VISION_API_KEY = os.environ.get('VISION_API_KEY', 'ollama')
 OLLAMA_STARTUP_TIMEOUT = float(os.environ.get('OLLAMA_STARTUP_TIMEOUT', '15'))
+# After a startup-timeout 'unavailable', a bounded background probe keeps
+# watching the spawned `ollama serve` so a slow-but-successful bring-up can
+# still upgrade the state to 'ready'.
+OLLAMA_REPROBE_TIMEOUT = float(os.environ.get('OLLAMA_REPROBE_TIMEOUT', '60'))
 TTS_WARMUP = os.environ.get('TTS_WARMUP', '1') != '0'
 HF_OFFLINE_IF_CACHED = os.environ.get('HF_OFFLINE_IF_CACHED', '1') != '0'
 
@@ -297,7 +301,6 @@ def get_pipeline():
                     t0 = time.monotonic()
                     pipeline = KPipeline(lang_code='a', repo_id=MODEL_REPO_ID, device=device)
                     model_load_ms = int((time.monotonic() - t0) * 1000)
-                    logging.info(f"[SERVER] Kokoro model loaded on {device} in {model_load_ms}ms.")
                     # Warmup lives here, under pipeline_lock, so it cannot
                     # race a real first request into a half-initialized pipe.
                     # Direct synthesis, not text_to_wav: that would re-enter
@@ -310,6 +313,10 @@ def get_pipeline():
                         with _phase('TTS warmup'):
                             for _ in pipeline('Hello.', voice=DEFAULT_VOICE):
                                 pass
+                    # The 'loaded' line emits only after the warmup validated
+                    # the device, so a warmup failure never reads as a success.
+                    # The ms number still covers construction only.
+                    logging.info(f"[SERVER] Kokoro model loaded on {device} in {model_load_ms}ms.")
                     MODEL_LOADED = True
                     return pipeline
                 except Exception as e:
@@ -487,6 +494,36 @@ def ensure_ollama_running() -> None:
     logging.warning(f"[OLLAMA] Started but did not respond within {OLLAMA_STARTUP_TIMEOUT:.0f}s; see {log_path}")
     log_file.close()
     OLLAMA_STATE = 'unavailable'
+    # A slow start is not a failed start: the spawned `serve` keeps running,
+    # so a bounded background probe can still upgrade the state.
+    threading.Thread(target=_ollama_late_probe, args=(api_bases,),
+                     name='ollama-late-probe', daemon=True).start()
+
+
+def _ollama_late_probe(api_bases: list) -> None:
+    """Bounded post-timeout watcher for 'unavailable' -> 'ready' upgrades only.
+
+    Runs on its own daemon thread so the `ollama ensure` phase still ends on
+    time. State transitions elsewhere are monotonic; this is the sole writer
+    allowed to move the state back up, and only from 'unavailable'.
+    """
+    global OLLAMA_STATE
+    try:
+        deadline = time.time() + OLLAMA_REPROBE_TIMEOUT
+        while time.time() < deadline:
+            if OLLAMA_STATE != 'unavailable':
+                return
+            if any(_ollama_is_running(api_base) for api_base in api_bases):
+                if OLLAMA_STATE == 'unavailable':
+                    logging.info("[OLLAMA] Late probe: ready at one of: "
+                                 + ', '.join(api_bases))
+                    OLLAMA_STATE = 'ready'
+                return
+            time.sleep(0.5)
+        logging.warning(f"[OLLAMA] Late probe: still not responding after "
+                        f"{OLLAMA_REPROBE_TIMEOUT:.0f}s; giving up")
+    except Exception as e:
+        logging.error(f"[OLLAMA] Late probe failed ({e})", exc_info=True)
 
 
 def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: list | None = None):

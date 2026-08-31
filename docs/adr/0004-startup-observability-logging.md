@@ -75,3 +75,23 @@ only which phase is measured where changes.
   `[PHASE] heavy imports took 5875ms` (matches the 5873 ms importtime profile); model load
   2141 ms with `HF_HUB_OFFLINE=1`; `[PHASE] TTS warmup took 1125ms`;
   `[PHASE] ollama ensure took 47ms` in parallel. Time to `model_loaded` ~8 s (was ~12 s).
+
+## Amendment (2026-08-31): review-followup log-shape adjustments
+
+Two review findings on PR #12 adjust log shapes and phase semantics; the formats frozen above
+are unchanged except where stated.
+
+- **Model-load line position**: `Kokoro model loaded on <device> in Nms` now emits only
+  after the warmup validates the device — immediately before `MODEL_LOADED = True` — so a
+  CUDA warmup failure no longer reads as a success (`[PHASE] TTS warmup failed after Nms`
+  now precedes any `loaded` line, then `falling back to CPU`). The ms value still measures
+  only `KPipeline()` construction, not warmup; readers sequencing the log should treat the
+  `[PHASE] TTS warmup took Xms` line as preceding the `loaded` line.
+- **New `[OLLAMA] Late probe:` lines**: after a startup-timeout `unavailable`, a bounded
+  background probe (60 s default, `OLLAMA_REPROBE_TIMEOUT`) watches the spawned `ollama
+  serve` and may upgrade the state to `ready`, logging `[OLLAMA] Late probe: ready at
+  one of: ...` (new shape) or `[OLLAMA] Late probe: still not responding after 60s; giving
+  up`. Consequently `[PHASE] ollama ensure took ~15s` no longer implies Ollama settled —
+  a late upgrade can land up to 60 s later outside any phase, attributable from the
+  `Late probe` lines alone. This keeps the "reproducible from logs/server.log alone"
+  consequence true.

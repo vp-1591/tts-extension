@@ -209,6 +209,19 @@ async function startHeartbeat() {
     }
     if (beat) {
       failures = 0;
+      // Piggyback a label refresh on the beat: Ollama settles (or dies) after
+      // goOnline repainted, and nothing else re-renders the ✓ line. Errors are
+      // swallowed — never counted toward the offline strike budget.
+      try {
+        const h = await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS) })
+          .then((r) => r.json());
+        if (serverOnline && h?.model_loaded && h.ollama !== lastHealth?.ollama) {
+          lastHealth = h;
+          renderOnlineStatus(h);
+        }
+      } catch {
+        // stale label for one more beat is fine; the POST above is the liveness signal
+      }
     } else if (++failures >= HEARTBEAT_MAX_FAILURES) {
       checkHealth();
       return;
