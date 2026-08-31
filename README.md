@@ -57,9 +57,8 @@ kokoro_server.py :5912  (runs natively on Windows)
 
 ## Prerequisites
 
-- **Windows** with **Python 3.10–3.12** for the server venv — kokoro requires `>=3.10,<3.13`
-  (on 3.13 its `numpy==1.26.4` pin has no wheels and the build fails)
-- `torch` (CUDA 12.8 wheel), `kokoro`, `numpy`, `soundfile` — install order matters, see below
+- **uv** (installs the pinned Python 3.12 automatically — kokoro requires `>=3.10,<3.13`;
+  on 3.13 its `numpy==1.26.4` pin has no wheels and the build fails)
 - **Ollama** running natively on Windows with a vision model (default: `gemma4:31b:cloud`)
 - **Chrome**
 - CUDA-capable GPU recommended (falls back to CPU automatically; OCR dominates latency)
@@ -67,25 +66,29 @@ kokoro_server.py :5912  (runs natively on Windows)
 ## Installation
 
 ```powershell
-# 1. Project venv (Python 3.12)
-python -m venv .venv            # or: uv venv .venv --python 3.12 --seed
+# 1. Install uv (once)
+winget install astral-sh.uv      # or: scoop install uv
 
-# 2. Python deps — install torch from the CUDA index FIRST, otherwise pip pulls a
-#    multi-GB CPU-only torch as a kokoro dependency
-.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\python.exe -m pip install kokoro numpy soundfile
+# 2. Create .venv and install everything from uv.lock — torch comes from the
+#    CUDA cu128 index automatically (the old "install torch FIRST" pip footgun
+#    is solved declaratively in pyproject.toml)
+uv sync
 
-# 3. Ollama vision model
+# 3. For the Playwright e2e test (optional)
+uv sync --group e2e
+uv run playwright install chromium
+
+# 4. Ollama vision model
 ollama pull gemma4:31b:cloud
 
-# 4. Register the native messaging host (no admin; writes under HKCU)
-.venv\Scripts\python.exe native_host\install.py
+# 5. Register the native messaging host (no admin; writes under HKCU)
+uv run python native_host/install.py
 
-#    Uninstall: .venv\Scripts\python.exe native_host\install.py --uninstall
+#    Uninstall: uv run python native_host/install.py --uninstall
 #    Custom ID/interpreter: --extension-id <ID> / --python <path>
 ```
 
-Note: **pip success ≠ TTS success** — the Kokoro G2P stage needs espeak-ng at runtime.
+Note: **a clean `uv sync` ≠ TTS success** — the Kokoro G2P stage needs espeak-ng at runtime.
 Verify with the smoke test below before assuming a working install.
 
 ## Loading the Extension in Chrome
@@ -103,7 +106,7 @@ once — the ID changes once and localStorage preferences (constraints/history) 
 
 ```bash
 # Optional — the panel auto-starts it. Manual starts never self-stop.
-python kokoro_server.py --port 5912 --host 127.0.0.1
+uv run kokoro_server.py --port 5912 --host 127.0.0.1
 ```
 
 The server automatically:
@@ -114,12 +117,12 @@ The server automatically:
 ## First-run smoke test
 
 ```bash
-./.venv/Scripts/python.exe kokoro_server.py   # leave running
+uv run kokoro_server.py   # leave running
 curl -X POST http://127.0.0.1:5912/tts -H "Content-Type: application/json" -d "{\"text\":\"windows check\"}" -o out.wav
 ```
 
-`out.wav` should be audible. If pip installed cleanly but this fails, the usual cause is the
-espeak-ng based G2P stage (runtime dependency, not a pip dependency).
+`out.wav` should be audible. If the install completed cleanly but this fails, the usual cause is the
+espeak-ng based G2P stage (runtime dependency, not packaged by pip).
 
 ## Features
 
@@ -188,11 +191,11 @@ Environment variables:
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `Specified native messaging host not found` | Host not registered — run `python native_host\install.py`, check `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.vp1591.tts_server` |
-| `Access to the specified native messaging host is forbidden` | `allowed_origins` doesn't match your extension ID — rerun `install.py --extension-id <your-ID>` |
-| `Native host has exited` | Run `python native_host\tts_native_host.py` by hand to see the error; check `logs/server_spawner.log` |
+| `Specified native messaging host not found` | Host not registered — run `uv run python native_host\install.py`, check `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.vp1591.tts_server` |
+| `Access to the specified native messaging host is forbidden` | `allowed_origins` doesn't match your extension ID — rerun `uv run python native_host\install.py --extension-id <your-ID>` |
+| `Native host has exited` | Run `uv run python native_host\tts_native_host.py` by hand to see the error; check `logs/server_spawner.log` |
 | Panel says offline even after reinstall | Copy your extension ID from `chrome://extensions` and pass it via `--extension-id` |
-| pip installs fine but every TTS request errors | G2P/espeak-ng runtime failure — install `espeakng-loader`/`phonemizer-fork`, retest with the smoke test above |
+| `uv sync` completes but every TTS request errors | G2P/espeak-ng runtime failure — install `espeakng-loader`/`phonemizer-fork`, retest with the smoke test above |
 | Server never stops | It wasn't started `--managed` (manual starts are intentionally persistent) |
 
 ## Logs
@@ -208,9 +211,9 @@ holds early-startup output from extension-spawned servers). Logged metrics inclu
 ## Testing
 
 ```bash
-# Project venv (Python 3.12); PYTHONDONTWRITEBYTECODE avoids stale __pycache__ breaking
+# uv-managed venv; PYTHONDONTWRITEBYTECODE avoids stale __pycache__ breaking
 # Chrome's unpacked-extension loader
-PYTHONDONTWRITEBYTECODE=1 ./.venv/Scripts/python.exe -m pytest tests/ -v
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/ -v
 ```
 
 If you run tests without it, delete bytecode dirs before reloading the extension

@@ -1,8 +1,10 @@
 ## Rules
 
-The Kokoro server runs natively on **Windows** under the project's Python 3.12 venv at
-`.venv/Scripts/python.exe` (kokoro requires `>=3.10,<3.13`; 3.13 cannot install it). Do not
-run the server or the tests from WSL; there is no WSL fallback.
+The Kokoro server runs natively on **Windows** under the uv-managed `.venv`
+(Python pinned to 3.12 via `.python-version`; kokoro requires `>=3.10,<3.13`; 3.13 cannot
+install it). Dependencies live in `pyproject.toml` + `uv.lock` — run everything through
+`uv run` (or `.venv/Scripts/python.exe` directly); after editing dependencies run `uv lock`
+and commit `uv.lock`. Do not run the server or the tests from WSL; there is no WSL fallback.
 
 The server is started and stopped automatically by the extension: the side panel spawns it
 through the `com.vp1591.tts_server` native-messaging host (`native_host/install.py` registers
@@ -13,7 +15,7 @@ it once under HKCU). Extension-spawned servers run with `--managed` and self-sto
 To launch the server by hand:
 
 ```bash
-./.venv/Scripts/python.exe kokoro_server.py
+uv run kokoro_server.py
 ```
 
 ## Logs
@@ -25,10 +27,10 @@ from the managed watchdog, and all errors with tracebacks.
 
 ## Tests
 
-Run with Windows Python 3.13 and `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__/` is created:
+Run with Windows Python 3.12 and `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__/` is created:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 ./.venv/Scripts/python.exe -m pytest tests/ -v
+PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/ -v
 ```
 
 ## __pycache__ warning

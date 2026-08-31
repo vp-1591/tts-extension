@@ -697,6 +697,8 @@ def text_to_wav(text: str, _retry: bool = True) -> bytes:
     import soundfile as sf
 
     pipe = get_pipeline()
+    if pipe is None:  # unreachable: get_pipeline raises on load failure
+        raise RuntimeError("Pipeline failed to load")
     try:
         all_audio = []
         for gs, ps, audio in pipe(text, voice=DEFAULT_VOICE):

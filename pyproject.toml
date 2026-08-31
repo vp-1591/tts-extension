@@ -1,0 +1,32 @@
+[project]
+name = "tts-extension"
+version = "0.1.0"
+description = "Kokoro TTS backend server for the TTS screen reader Chrome extension"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch==2.11.*",
+    "kokoro==0.9.4",
+    "numpy",
+    "soundfile",
+    "espeakng-loader",
+    "phonemizer-fork",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+
+[dependency-groups]
+test = ["pytest>=9"]
+lint = ["ruff==0.16.5", "pyright"]
+e2e = ["playwright>=1.49"]
+
+[tool.uv]
+# Not a buildable/installable package — just dependency management for the server scripts.
+package = false
+default-groups = ["test", "lint"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
