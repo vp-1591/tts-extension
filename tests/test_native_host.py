@@ -4,13 +4,16 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'native_host'))
 
-tts_native_host = importlib.import_module('tts_native_host')
-install = importlib.import_module('install')
+# Modules loaded dynamically and mutated per-test; Any tells pyright these
+# module objects accept attribute injection.
+tts_native_host: Any = importlib.import_module('tts_native_host')
+install: Any = importlib.import_module('install')
 
 
 class NativeMessagingProtocolTests(unittest.TestCase):

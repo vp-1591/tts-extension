@@ -16,11 +16,15 @@ jobs:
 
       # Torch-free install: tests stub torch; skips the multi-GB CUDA wheel.
       # --locked fails if uv.lock does not match pyproject.toml.
+      # e2e group: pyright must resolve playwright.sync_api in the e2e script.
       - name: Install dependencies
-        run: uv sync --locked --no-install-package torch
+        run: uv sync --locked --no-install-package torch --group e2e
 
       - name: Lint (ruff)
         run: uv run --no-sync ruff check kokoro_server.py native_host/ tests/
+
+      - name: Type check (pyright)
+        run: uv run --no-sync pyright
 
       - name: Run tests
         env:

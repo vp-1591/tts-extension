@@ -327,7 +327,7 @@ def get_pipeline():
                     if device == 'cuda':
                         logging.warning(f"[SERVER] CUDA failed ({e}); falling back to CPU...")
                         try:
-                            import torch
+                            import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
                             torch.cuda.empty_cache()
                         except Exception:
                             pass
@@ -343,7 +343,7 @@ def reset_pipeline():
         if pipeline is not None:
             logging.warning("[SERVER] Resetting Kokoro pipeline due to CUDA error...")
             try:
-                import torch
+                import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
                 torch.cuda.empty_cache()
             except Exception:
                 pass
@@ -362,7 +362,7 @@ def is_cuda_error(exc: BaseException) -> bool:
         return True
     # torch exceptions
     try:
-        import torch
+        import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
         if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
     except ImportError:
@@ -538,7 +538,7 @@ def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: l
         user_text = constraints
     system_prompt = OCR_SYSTEM_PROMPT_CONSTRAINED if constraints else OCR_SYSTEM_PROMPT_PLAIN
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages: list[dict[str, str | list[str]]] = [{"role": "system", "content": system_prompt}]
 
     if history_turns:
         for turn in history_turns:
@@ -992,11 +992,6 @@ def main():
     logging.info(f"[SERVER] Stdlib imports took {time.monotonic() - _BOOT_START:.2f}s")
     logging.info(f"[SERVER] Starting on {args.host}:{args.port} (managed={MANAGED})")
     ensure_conversation_dir()
-
-    # Allow large payloads (screenshots can be ~5MB base64)
-    # Override both server and handler limits
-    import http.server
-    http.server.BaseHTTPRequestHandler.max_request_line = 10 * 1024 * 1024  # 10MB
 
     # Bind before loading the model so /health answers (reporting model_loaded:
     # false) while the ~10s load runs — the panel can tell "starting" from
