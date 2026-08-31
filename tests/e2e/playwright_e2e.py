@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[2]
 EXT_ID = 'habcfbjmnckpiaockfecaibphndkacac'
 HEALTH_URL = 'http://127.0.0.1:5912/health'
 STATUS_SELECTOR = '#status'
-ONLINE_TEXT = 'Server online'
+ONLINE_TEXT = '✓ Online'  # compose site: panel.js renderOnlineStatus()/goOnline()
 
 failures = []
 results = []

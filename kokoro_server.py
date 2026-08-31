@@ -57,6 +57,11 @@ _boot('stdlib imports done')
 SAMPLE_RATE = 24000
 DEFAULT_VOICE = 'af_bella'
 MODEL_REPO_ID = 'hexgrad/Kokoro-82M'
+# Weights filename inside models--hexgrad--Kokoro-82M snapshots; verified
+# against the live local snapshot listing (config.json + kokoro-v1_0.pth +
+# voices/af_bella.pt, refs/main → f3ff3571...). Not derived from
+# KModel.MODEL_NAMES, which requires the torch import this gate must precede.
+MODEL_WEIGHTS_FILE = 'kokoro-v1_0.pth'
 
 # --- Logging ---
 LOGS_DIR = Path(__file__).parent / 'logs'
@@ -237,18 +242,35 @@ def _kokoro_model_cached() -> bool:
     """True when the Kokoro weights AND the pinned voice are already in the
     local HF cache, so no network round-trip is needed and HF_HUB_OFFLINE can
     be set safely. The voice file (voices/<name>.pt) is downloaded lazily at
-    synthesis time by kokoro, so a weights-only cache with HF_HUB_OFFLINE=1
-    would fail every /tts forever."""
+    first synthesis by kokoro (.venv/Lib/site-packages/kokoro/pipeline.py:142,
+    hf_hub_download), so a weights-only cache with HF_HUB_OFFLINE=1 would fail
+    every /tts forever.
+
+    Mirrors huggingface_hub's cache resolution (try_to_load_from_cache,
+    huggingface_hub/file_download.py:1482-1573): refs/main → commit →
+    snapshots/<commit>/ — NOT any complete-looking snapshots/* dir. A ref
+    still pointing at a partially-downloaded snapshot (written before the
+    blobs land) must keep the gate OPEN, or the lazy download can never run.
+    Fail-open (False) on any missing/unreadable/empty ref so the speedup
+    disarms silently rather than blocking the download. Kept hand-rolled
+    instead of importing huggingface_hub here: its constants snapshot
+    HF_HUB_OFFLINE at import time, and this runs before we arm it
+    (get_pipeline imports kokoro only after this gate)."""
     try:
         slug = f'models--{MODEL_REPO_ID.replace("/", "--")}'
-        snapshots = _hf_cache_dir() / slug / 'snapshots'
-        return any(
-            (d / 'config.json').is_file()
-            and (d / 'kokoro-v1_0.pth').is_file()
-            and (d / 'voices' / f'{DEFAULT_VOICE}.pt').is_file()
-            for d in snapshots.iterdir() if d.is_dir()
+        root = _hf_cache_dir() / slug
+        # Read verbatim, no strip: hub reads refs unstripped
+        # (file_download.py:1557), so a newline/CRLF-padded ref resolves to a
+        # nonexistent snapshot there — stripping here would arm offline mode
+        # hub can't satisfy, making every /tts fail with no recovery.
+        commit = (root / 'refs' / 'main').read_text(encoding='utf-8')
+        snapshot = root / 'snapshots' / commit
+        return (
+            (snapshot / 'config.json').is_file()
+            and (snapshot / MODEL_WEIGHTS_FILE).is_file()
+            and (snapshot / 'voices' / f'{DEFAULT_VOICE}.pt').is_file()
         )
-    except OSError:
+    except (OSError, ValueError):  # ValueError: undecodable ref file
         return False
 
 
@@ -891,7 +913,7 @@ def load_model():
     except Exception as e:
         # exc_info keeps the loader-thread traceback in logs/server.log; without
         # it a broken dependency fails with a one-line message and no cause.
-        logging.error(f"[SERVER] Model load failed ({e}); model will load on first request.",
+        logging.error(f"[SERVER] Model load failed ({e}); cannot load until the cause is fixed — see traceback; panel stays offline.",
                       exc_info=True)
 
 
@@ -900,6 +922,12 @@ def ensure_ollama():
         with _phase('ollama ensure'):
             ensure_ollama_running()
     except Exception as e:
+        # A crash before ensure_ollama_running's first state write (unreadable
+        # VISION_API_BASE, unwritable log) must still land a terminal state,
+        # or /health reports 'starting' forever and every panel click waits
+        # out its full bounded OCR wait.
+        global OLLAMA_STATE
+        OLLAMA_STATE = 'unavailable'
         logging.error(f"[OLLAMA] ensure failed ({e})", exc_info=True)
 
 

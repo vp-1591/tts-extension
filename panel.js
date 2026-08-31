@@ -84,18 +84,24 @@ function ocrLabel(d) {
 async function waitUntilOcrReady() {
   if (lastHealth && lastHealth.ollama !== 'starting') return;
   const deadline = Date.now() + OCR_WAIT_TIMEOUT_MS;
+  let fresh = null;
   while (Date.now() < deadline) {
     setStatus('⏳ OCR warming up...', 'warn');
-    const d = await fetch(`${SERVER}/health`).then((r) => r.json()).catch(() => null);
-    if (d) {
-      lastHealth = d;
-      if (d.ollama !== 'starting') break;
-    } else {
+    const d = await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS) })
+      .then((r) => r.json()).catch(() => null);
+    if (!d) {
+      // Server down or parked: keep the honest in-loop status ('⏳ OCR warming
+      // up...') — the immediately-following /ocr_tts surfaces the real error.
+      fresh = null;
       break;
     }
+    fresh = d;
+    lastHealth = d;
+    if (d.ollama !== 'starting') break;
     await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
   }
-  if (lastHealth) setStatus(`✓ Online — ${ocrLabel(lastHealth)} (${lastHealth?.vision || '?'})`, 'ok');
+  // Paint only from a health dict fetched in THIS call — never stale state.
+  if (fresh) renderOnlineStatus(fresh);
 }
 
 function setStatus(text, cls) {
@@ -165,19 +171,26 @@ async function checkHealth() {
     goOnline(d);
   } else {
     setStatus('⏳ Starting server (model loading)...', 'warn');
-    if (await pollUntilHealthy()) {
-      goOnline(d);
+    const fresh = await pollUntilHealthy();
+    if (fresh) {
+      goOnline(fresh);
     } else {
       renderOffline();
     }
   }
 }
 
+// Single composer for the ✓ Online line; all callers that learn the server is
+// up go through this so the OCR label and model name can't drift apart.
+function renderOnlineStatus(d) {
+  statusEl.textContent = `✓ Online — ${ocrLabel(d)} (${d?.vision || '?'})`;
+  statusEl.className = 'status ok';
+}
+
 function goOnline(d) {
   serverOnline = true;
   lastHealth = d;
-  statusEl.textContent = `✓ Online — ${ocrLabel(d)} (${d?.vision || '?'})`;
-  statusEl.className = 'status ok';
+  renderOnlineStatus(d);
   btnRead.disabled = false;
   startHeartbeat();
 }
@@ -205,6 +218,9 @@ async function startHeartbeat() {
 
 btnRead.addEventListener('click', async () => {
   if (playing) { stop(); return; }
+  // Disable before any await: a second click during the bounded OCR wait would
+  // otherwise start a concurrent capture/stream and clobber the shared state.
+  btnRead.disabled = true;
   errorEl.style.display = 'none';
   ocrTextEl.style.display = 'none';
 
@@ -215,7 +231,6 @@ btnRead.addEventListener('click', async () => {
 
   // 1. Capture screenshot of the current tab
   btnRead.textContent = '📸 Capturing screen...';
-  btnRead.disabled = true;
 
   let dataUrl;
   try {

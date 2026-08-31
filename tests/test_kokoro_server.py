@@ -541,6 +541,29 @@ class BrokenDependencyTests(SingleVoiceTestBase):
         self.assertIsNotNone(failed[0].exc_info, 'expected a real traceback')
 
 
+def _make_refs_cache(root: Path, commit: str = 'abc123', write_ref: bool = True,
+                     with_pth: bool = True, with_voice: bool = True) -> Path:
+    """Build a hub-layout cache: refs/main → commit → snapshots/<commit>/ with
+    config.json + MODEL_WEIGHTS_FILE + voices/<DEFAULT_VOICE>.pt. Names derive
+    from the module constants, never hand-copied (mirroring rule)."""
+    slug = f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+    (root / slug / 'refs').mkdir(parents=True)
+    if write_ref:
+        # No trailing newline: huggingface_hub writes refs verbatim
+        # (file_download.py:723 write_text(commit_hash)) and reads them back
+        # unstripped (:1557), so a fixture newline diverges from reality.
+        (root / slug / 'refs' / 'main').write_text(commit, encoding='utf-8')
+    snapshot = root / slug / 'snapshots' / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text('{}')
+    if with_pth:
+        (snapshot / kokoro_server.MODEL_WEIGHTS_FILE).write_bytes(b'weights')
+    if with_voice:
+        (snapshot / 'voices').mkdir()
+        (snapshot / 'voices' / f'{kokoro_server.DEFAULT_VOICE}.pt').write_bytes(b'voice')
+    return root
+
+
 class HfOfflineGatingTests(unittest.TestCase):
     """Issue #9: set HF_HUB_OFFLINE=1 before the kokoro import when the model is cached."""
 
@@ -611,16 +634,7 @@ class HfOfflineGatingTests(unittest.TestCase):
             self.assertEqual(kokoro_server._hf_cache_dir(), Path.home() / 'hfcache')
 
     def _make_cache(self, root: Path, with_pth: bool = True, with_voice: bool = True) -> Path:
-        slug = f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
-        snapshot = root / slug / 'snapshots' / 'abc123'
-        snapshot.mkdir(parents=True)
-        (snapshot / 'config.json').write_text('{}')
-        if with_pth:
-            (snapshot / 'kokoro-v1_0.pth').write_bytes(b'weights')
-        if with_voice:
-            (snapshot / 'voices').mkdir()
-            (snapshot / 'voices' / f'{kokoro_server.DEFAULT_VOICE}.pt').write_bytes(b'voice')
-        return root
+        return _make_refs_cache(root, with_pth=with_pth, with_voice=with_voice)
 
     def test_kokoro_model_cached_true_when_snapshot_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -675,9 +689,146 @@ class HfOfflineGatingTests(unittest.TestCase):
 
         self.assertNotIn('HF_HUB_OFFLINE', os.environ)
 
+    def test_kokoro_model_cached_false_without_refs_main(self):
+        # Real resolver semantics: without refs/main there is no authoritative
+        # revision, so the gate must stay open (False) even though a complete
+        # snapshot exists.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            ref = (root / f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+                   / 'refs' / 'main')
+            ref.unlink()
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_ref_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            ref = (root / f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+                   / 'refs' / 'main')
+            ref.write_text('', encoding='utf-8')
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_ref_points_to_missing_snapshot(self):
+        # The window this fix exists for: huggingface_hub writes the ref before
+        # blobs finish landing, so a valid ref can target a partial snapshot.
+        # Ref written verbatim (no strip): see _make_refs_cache.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            ref = (root / f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+                   / 'refs' / 'main')
+            ref.write_text('deadbeef', encoding='utf-8')
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_ref_newline_padded(self):
+        # hub reads refs unstripped, so a CRLF-padded ref (e.g. hand-written
+        # via `echo sha > refs/main`) resolves to a nonexistent snapshot there;
+        # the gate must stay OPEN rather than arm an offline mode hub can't
+        # satisfy.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            ref = (root / f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+                   / 'refs' / 'main')
+            ref.write_bytes(ref.read_bytes() + b'\r\n')
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_ignores_stale_complete_snapshot(self):
+        # The reviewer's exact scenario: refs/main resolves to a partial
+        # snapshot while a complete-looking snapshots/* dir from the old scan
+        # exists — the gate must follow the ref, not the stale dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp))
+            slug = f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+            (root / slug / 'refs' / 'main').write_text('partial', encoding='utf-8')
+            partial = root / slug / 'snapshots' / 'partial'
+            partial.mkdir(parents=True)
+            (partial / 'config.json').write_text('{}')
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+
+class HfCacheMirroringTests(unittest.TestCase):
+    """Mirroring rule (global CLAUDE.md): the hand-rolled refs gate must agree
+    with the real huggingface_hub resolver. This exercises
+    try_to_load_from_cache (huggingface_hub/file_download.py:1482-1573) live,
+    so a future hub layout change makes the test disagree with
+    _kokoro_model_cached() and flags the drift. Lazy import is safe here —
+    only the server's offline-arming path must avoid importing huggingface_hub
+    (constants.py pins HF_HUB_OFFLINE at import time); tests have no arming
+    concern."""
+
+    def _hub_sees_complete(self, root: Path) -> bool:
+        from huggingface_hub import try_to_load_from_cache
+        for filename in ('config.json', kokoro_server.MODEL_WEIGHTS_FILE,
+                         f"voices/{kokoro_server.DEFAULT_VOICE}.pt"):
+            got = try_to_load_from_cache(kokoro_server.MODEL_REPO_ID, filename,
+                                         cache_dir=root)
+            # Returns a str path (or _CACHED_NO_EXIST / None), not a Path.
+            if not (isinstance(got, (str, Path)) and Path(got).is_file()):
+                return False
+        return True
+
+    def test_gate_agrees_with_try_to_load_from_cache(self):
+        slug = f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
+
+        def make_stale_partial(root: Path) -> Path:
+            _make_refs_cache(root)
+            (root / slug / 'refs' / 'main').write_text('partial', encoding='utf-8')
+            partial = root / slug / 'snapshots' / 'partial'
+            partial.mkdir(parents=True)
+            (partial / 'config.json').write_text('{}')
+            return root
+
+        def make_crlf_ref(root: Path) -> Path:
+            # Pairs a CRLF-padded ref with a COMPLETE snapshot: hub resolves
+            # the ref unstripped and finds nothing, so a stripping gate would
+            # arm an unsatisfiable offline mode — this case detects that
+            # divergence.
+            root = _make_refs_cache(root)
+            ref = root / slug / 'refs' / 'main'
+            ref.write_bytes(ref.read_bytes() + b'\r\n')
+            return root
+
+        def make_dead_ref(root: Path) -> Path:
+            # Ref points at a snapshot that was never downloaded (decoupled
+            # from the fixture's own snapshot dir).
+            root = _make_refs_cache(root)
+            (root / slug / 'refs' / 'main').write_text('deadbeef', encoding='utf-8')
+            return root
+
+        cases = [
+            ('complete', _make_refs_cache),
+            ('stale-partial', make_stale_partial),
+            ('no-refs', lambda r: _make_refs_cache(r, write_ref=False)),
+            ('ref-to-missing-snapshot', make_dead_ref),
+            ('crlf-ref-over-complete-snapshot', make_crlf_ref),
+        ]
+        for label, build in cases:
+            with self.subTest(fixture=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = build(Path(tmp))
+                    with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                        gate = kokoro_server._kokoro_model_cached()
+                    self.assertEqual(
+                        gate, self._hub_sees_complete(root),
+                        f'gate said {gate} but real resolver disagrees ({label})')
+
 
 class BackgroundTasksTests(unittest.TestCase):
     """Issue #7: ollama bring-up must not serialize behind the Kokoro model load."""
+
+    def setUp(self):
+        # unittest runs methods alphabetically: earlier tests in this class and
+        # in HfOfflineGatingTests etc. leave OLLAMA_STATE='unavailable', which
+        # would make a terminal-state assertion here pass vacuously.
+        self._ollama_state = kokoro_server.OLLAMA_STATE
+        kokoro_server.OLLAMA_STATE = 'starting'
+
+    def tearDown(self):
+        kokoro_server.OLLAMA_STATE = self._ollama_state
 
     def test_start_background_tasks_starts_two_threads(self):
         threads = []
@@ -719,6 +870,7 @@ class BackgroundTasksTests(unittest.TestCase):
         self.assertTrue(any('[OLLAMA] ensure failed' in line for line in logs.output))
         failed = [r for r in logs.records if '[OLLAMA] ensure failed' in r.getMessage()]
         self.assertIsNotNone(failed[0].exc_info, 'expected a real traceback')
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'unavailable')
 
     def test_ensure_ollama_running_marks_unavailable_when_missing(self):
         # Not-found is a terminal branch: OLLAMA_STATE must land on
