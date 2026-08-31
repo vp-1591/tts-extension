@@ -27,7 +27,7 @@ from the managed watchdog, and all errors with tracebacks.
 
 ## Tests
 
-Run with Windows Python 3.13 and `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__/` is created:
+Run with Windows Python 3.12 and `PYTHONDONTWRITEBYTECODE=1` so no `__pycache__/` is created:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 uv run pytest tests/ -v

@@ -88,7 +88,7 @@ uv run python native_host/install.py
 #    Custom ID/interpreter: --extension-id <ID> / --python <path>
 ```
 
-Note: **pip success ≠ TTS success** — the Kokoro G2P stage needs espeak-ng at runtime.
+Note: **a clean `uv sync` ≠ TTS success** — the Kokoro G2P stage needs espeak-ng at runtime.
 Verify with the smoke test below before assuming a working install.
 
 ## Loading the Extension in Chrome
@@ -121,8 +121,8 @@ uv run kokoro_server.py   # leave running
 curl -X POST http://127.0.0.1:5912/tts -H "Content-Type: application/json" -d "{\"text\":\"windows check\"}" -o out.wav
 ```
 
-`out.wav` should be audible. If pip installed cleanly but this fails, the usual cause is the
-espeak-ng based G2P stage (runtime dependency, not a pip dependency).
+`out.wav` should be audible. If the install completed cleanly but this fails, the usual cause is the
+espeak-ng based G2P stage (runtime dependency, not packaged by pip).
 
 ## Features
 
@@ -195,7 +195,7 @@ Environment variables:
 | `Access to the specified native messaging host is forbidden` | `allowed_origins` doesn't match your extension ID — rerun `uv run python native_host\install.py --extension-id <your-ID>` |
 | `Native host has exited` | Run `uv run python native_host\tts_native_host.py` by hand to see the error; check `logs/server_spawner.log` |
 | Panel says offline even after reinstall | Copy your extension ID from `chrome://extensions` and pass it via `--extension-id` |
-| pip installs fine but every TTS request errors | G2P/espeak-ng runtime failure — install `espeakng-loader`/`phonemizer-fork`, retest with the smoke test above |
+| `uv sync` completes but every TTS request errors | G2P/espeak-ng runtime failure — install `espeakng-loader`/`phonemizer-fork`, retest with the smoke test above |
 | Server never stops | It wasn't started `--managed` (manual starts are intentionally persistent) |
 
 ## Logs

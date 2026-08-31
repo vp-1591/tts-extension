@@ -19,6 +19,8 @@ lint = ["ruff==0.16.5", "pyright"]
 e2e = ["playwright>=1.49"]
 
 [tool.uv]
+# Not a buildable/installable package — just dependency management for the server scripts.
+package = false
 default-groups = ["test", "lint"]
 
 [tool.uv.sources]
