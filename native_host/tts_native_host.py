@@ -127,7 +127,7 @@ def main() -> None:
             send_message({'type': 'ready', 'model_loaded': bool(state.get('model_loaded'))})
             _host_log(f'ready after {time.monotonic() - started_at:.2f}s')
             return
-        time.sleep(1)
+        time.sleep(0.5)
 
     _host_log(f'failed after {time.monotonic() - started_at:.2f}s')
     send_message({'type': 'failed', 'error': _spawner_log_tail()})

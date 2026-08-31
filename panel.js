@@ -7,7 +7,6 @@ let playing = false;
 
 const btnRead = document.getElementById('btn-read');
 const statusEl = document.getElementById('status');
-const voiceSelect = document.getElementById('voice');
 const constraintsEl = document.getElementById('constraints');
 const ocrTextEl = document.getElementById('ocr-text');
 const errorEl = document.getElementById('error');
@@ -16,12 +15,6 @@ const btnNewConv = document.getElementById('btn-new-conv');
 const convIndicator = document.getElementById('conv-indicator');
 
 // Restore saved preferences
-const savedVoice = localStorage.getItem('tts-voice');
-if (savedVoice) voiceSelect.value = savedVoice;
-voiceSelect.addEventListener('change', () => {
-  localStorage.setItem('tts-voice', voiceSelect.value);
-});
-
 const savedConstraints = localStorage.getItem('tts-constraints');
 if (savedConstraints) constraintsEl.value = savedConstraints;
 constraintsEl.addEventListener('input', () => {
@@ -59,10 +52,13 @@ btnNewConv.addEventListener('click', async () => {
   }
 });
 
-const START_POLL_MS = 1500;
+const START_POLL_MS = 500;
 const START_TIMEOUT_MS = 90000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
+// Bounded wait when the vision backend is still warming up (health 'starting')
+// before firing the first OCR request.
+const OCR_WAIT_TIMEOUT_MS = 10000;
 // The server is single-threaded: a heartbeat can queue behind an in-flight
 // /ocr_tts for a long time, so only 3 consecutive failures mean "offline".
 const HEARTBEAT_MAX_FAILURES = 3;
@@ -70,6 +66,43 @@ const NATIVE_HOST = 'com.vp1591.tts_server';
 
 let nativePort = null;
 let serverOnline = false;
+let lastHealth = null;
+
+// Ollama (the vision backend) warms up in parallel with the TTS model and
+// may lag model_loaded; firing OCR during that window burns ocr's retry
+// budget on a guaranteed failure. Values: 'ready' | 'starting' |
+// 'unavailable'; a server too old to send the field is treated as ready.
+function ocrLabel(d) {
+  if (d?.ollama === 'starting') return 'OCR warming up';
+  if (d?.ollama === 'unavailable') return 'OCR unavailable';
+  return 'OCR ready';
+}
+
+// Bounded pre-OCR wait that only runs for the genuinely transitional state.
+// Probe failure means the server is unreachable: proceed immediately and let
+// the request surface the real error instead of stalling.
+async function waitUntilOcrReady() {
+  if (lastHealth && lastHealth.ollama !== 'starting') return;
+  const deadline = Date.now() + OCR_WAIT_TIMEOUT_MS;
+  let fresh = null;
+  while (Date.now() < deadline) {
+    setStatus('⏳ OCR warming up...', 'warn');
+    const d = await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS) })
+      .then((r) => r.json()).catch(() => null);
+    if (!d) {
+      // Server down or parked: keep the honest in-loop status ('⏳ OCR warming
+      // up...') — the immediately-following /ocr_tts surfaces the real error.
+      fresh = null;
+      break;
+    }
+    fresh = d;
+    lastHealth = d;
+    if (d.ollama !== 'starting') break;
+    await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+  }
+  // Paint only from a health dict fetched in THIS call — never stale state.
+  if (fresh) renderOnlineStatus(fresh);
+}
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -138,18 +171,26 @@ async function checkHealth() {
     goOnline(d);
   } else {
     setStatus('⏳ Starting server (model loading)...', 'warn');
-    if (await pollUntilHealthy()) {
-      goOnline(d);
+    const fresh = await pollUntilHealthy();
+    if (fresh) {
+      goOnline(fresh);
     } else {
       renderOffline();
     }
   }
 }
 
+// Single composer for the ✓ Online line; all callers that learn the server is
+// up go through this so the OCR label and model name can't drift apart.
+function renderOnlineStatus(d) {
+  statusEl.textContent = `✓ Online — ${ocrLabel(d)} (${d?.vision || '?'})`;
+  statusEl.className = 'status ok';
+}
+
 function goOnline(d) {
   serverOnline = true;
-  statusEl.textContent = `✓ Server online (${d?.vision || '?'})`;
-  statusEl.className = 'status ok';
+  lastHealth = d;
+  renderOnlineStatus(d);
   btnRead.disabled = false;
   startHeartbeat();
 }
@@ -168,6 +209,19 @@ async function startHeartbeat() {
     }
     if (beat) {
       failures = 0;
+      // Piggyback a label refresh on the beat: Ollama settles (or dies) after
+      // goOnline repainted, and nothing else re-renders the ✓ line. Errors are
+      // swallowed — never counted toward the offline strike budget.
+      try {
+        const h = await fetch(`${SERVER}/health`, { signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS) })
+          .then((r) => r.json());
+        if (serverOnline && h?.model_loaded && h.ollama !== lastHealth?.ollama) {
+          lastHealth = h;
+          renderOnlineStatus(h);
+        }
+      } catch {
+        // stale label for one more beat is fine; the POST above is the liveness signal
+      }
     } else if (++failures >= HEARTBEAT_MAX_FAILURES) {
       checkHealth();
       return;
@@ -177,12 +231,19 @@ async function startHeartbeat() {
 
 btnRead.addEventListener('click', async () => {
   if (playing) { stop(); return; }
+  // Disable before any await: a second click during the bounded OCR wait would
+  // otherwise start a concurrent capture/stream and clobber the shared state.
+  btnRead.disabled = true;
   errorEl.style.display = 'none';
   ocrTextEl.style.display = 'none';
 
+  // Ollama may still be warming up even though the TTS model is loaded; wait
+  // it out (bounded) pre-capture. waitUntilOcrReady only polls while health
+  // reports 'starting', so this is a no-op once Ollama is ready/unavailable.
+  await waitUntilOcrReady();
+
   // 1. Capture screenshot of the current tab
   btnRead.textContent = '📸 Capturing screen...';
-  btnRead.disabled = true;
 
   let dataUrl;
   try {
@@ -200,7 +261,7 @@ btnRead.addEventListener('click', async () => {
   // 3. Send to server: screenshot -> OCR -> TTS
   try {
     // Build request payload with optional constraints
-    const payload = { image: base64, voice: voiceSelect.value };
+    const payload = { image: base64 };
     const constraints = constraintsEl.value.trim();
     if (constraints) {
       payload.constraints = constraints;

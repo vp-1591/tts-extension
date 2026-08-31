@@ -38,7 +38,6 @@ kokoro_server.py :5912  (runs natively on Windows)
     │                   NDJSON stream ──► Chrome plays audio chunks
     │
     ├── POST /tts ──► text → Kokoro TTS → WAV
-    ├── GET  /voices ──► available voice list
     ├── GET  /health ──► server status + model info
     ├── GET  /conversation_state ──► current conversation ID + turn count
     └── POST /new_conversation ──► create fresh conversation
@@ -98,7 +97,7 @@ Verify with the smoke test below before assuming a working install.
 
 The manifest pins the extension ID via its `key` field, so the ID is stable across load-path
 changes. If you load the extension for the first time after this change, remove + re-add it
-once — the ID changes once and localStorage preferences (voice/constraints/history) reset.
+once — the ID changes once and localStorage preferences (constraints/history) reset.
 
 ## Running the Server Manually
 
@@ -128,7 +127,7 @@ espeak-ng based G2P stage (runtime dependency, not a pip dependency).
 |---------|-------------|
 | **Streaming pipeline** | Audio plays incrementally as OCR progresses |
 | **Auto-start / auto-stop** | Server starts when the panel opens; stops ~90 s after the last panel closes |
-| **Multiple voices** | US/UK, male/female voices via Kokoro 82M |
+| **Single voice** | Bella (US female) via Kokoro 82M |
 | **Optional constraints** | Custom prompt to guide OCR output |
 | **Conversation history** | Toggle to save multi-turn context for the vision model |
 | **New conversation** | `+` button starts a fresh session |
@@ -152,7 +151,6 @@ When disabled, the extension operates in stateless mode — no data is saved or 
 | `POST` | `/ocr_tts` | Screenshot → OCR → TTS streaming pipeline |
 | `POST` | `/tts` | Plain text → TTS audio |
 | `POST` | `/panel-heartbeat` | Panel liveness ping (drives managed auto-stop) |
-| `GET` | `/voices` | List available voices |
 | `GET` | `/health` | Server status, `model_loaded`, `managed` |
 | `GET` | `/conversation_state` | Current conversation ID and turn count |
 | `POST` | `/new_conversation` | Create a new conversation |
@@ -162,7 +160,6 @@ When disabled, the extension operates in stateless mode — no data is saved or 
 ```json
 {
   "image": "<base64_png>",
-  "voice": "af_bella",
   "constraints": "Only read headers",
   "history": true,
   "conversation_id": "conv_20260618_105539"
@@ -183,7 +180,8 @@ Environment variables:
 | `VISION_API_BASE` | `http://127.0.0.1:11434` | Ollama API URL |
 | `VISION_API_KEY` | `ollama` | API key |
 | `OLLAMA_STARTUP_TIMEOUT` | `15` | Seconds to wait for Ollama startup |
-| `TTS_SKIP_WARM` | `1` | Skip Kokoro warm-up |
+| `TTS_WARMUP` | `1` | Run a tiny warmup synthesis after model load (0 disables — skips CUDA kernel warm-up, first TTS chunk then costs 1.3-3.1s) |
+| `HF_OFFLINE_IF_CACHED` | `1` | Set `HF_HUB_OFFLINE=1` automatically when the Kokoro weights AND `voices/af_bella.pt` are present in the local HF cache (0 always fetches; a weights-only cache stays online so the voice can be lazily downloaded) |
 | `HEARTBEAT_GRACE` | `90` | Seconds of silence before a `--managed` server stops |
 
 ## Troubleshooting
