@@ -327,7 +327,7 @@ def get_pipeline():
                     if device == 'cuda':
                         logging.warning(f"[SERVER] CUDA failed ({e}); falling back to CPU...")
                         try:
-                            import torch
+                            import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
                             torch.cuda.empty_cache()
                         except Exception:
                             pass
@@ -343,7 +343,7 @@ def reset_pipeline():
         if pipeline is not None:
             logging.warning("[SERVER] Resetting Kokoro pipeline due to CUDA error...")
             try:
-                import torch
+                import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
                 torch.cuda.empty_cache()
             except Exception:
                 pass
@@ -362,7 +362,7 @@ def is_cuda_error(exc: BaseException) -> bool:
         return True
     # torch exceptions
     try:
-        import torch
+        import torch  # type: ignore[import-not-found]  # optional at runtime (CI runs torch-free)
         if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
     except ImportError:
