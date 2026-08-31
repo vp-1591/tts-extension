@@ -181,7 +181,7 @@ Environment variables:
 | `VISION_API_KEY` | `ollama` | API key |
 | `OLLAMA_STARTUP_TIMEOUT` | `15` | Seconds to wait for Ollama startup |
 | `TTS_WARMUP` | `1` | Run a tiny warmup synthesis after model load (0 disables — skips CUDA kernel warm-up, first TTS chunk then costs 1.3-3.1s) |
-| `HF_OFFLINE_IF_CACHED` | `1` | Set `HF_HUB_OFFLINE=1` automatically when the Kokoro model is present in the local HF cache (0 always fetches; only needed if you change `DEFAULT_VOICE` to a voice not yet in the cache) |
+| `HF_OFFLINE_IF_CACHED` | `1` | Set `HF_HUB_OFFLINE=1` automatically when the Kokoro weights AND `voices/af_bella.pt` are present in the local HF cache (0 always fetches; a weights-only cache stays online so the voice can be lazily downloaded) |
 | `HEARTBEAT_GRACE` | `90` | Seconds of silence before a `--managed` server stops |
 
 ## Troubleshooting

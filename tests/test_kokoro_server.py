@@ -55,10 +55,26 @@ class FlushableBytesIO(io.BytesIO):
         self.flush_count += 1
 
 
-class SingleVoiceTestBase(unittest.TestCase):
+class HandlerStubMixin:
+    """A bare handler instance (no BaseHTTPRequestHandler.__init__) wired to
+    buffered streams, shared by every test driving real handler methods."""
+
+    def make_handler(self):
+        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
+        handler.rfile = io.BytesIO(b'')
+        handler.wfile = FlushableBytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+
+class SingleVoiceTestBase(HandlerStubMixin, unittest.TestCase):
     """Runs through the real get_pipeline() -> FakePipeline path (never mocks
     get_pipeline/text_to_wav). _hf_cache_dir is pointed at an empty dir so
-    get_pipeline cannot read the warm machine's cache and flip HF_HUB_OFFLINE."""
+    get_pipeline cannot read the warm machine's cache and flip HF_HUB_OFFLINE;
+    TTS_WARMUP/HF_OFFLINE_IF_CACHED are forced off the ambient env so ambient
+    values can never flip test outcomes (finding #5)."""
 
     def setUp(self):
         kokoro_server.pipeline = None
@@ -67,6 +83,8 @@ class SingleVoiceTestBase(unittest.TestCase):
         # only want the request boundary.
         self._warmup = kokoro_server.TTS_WARMUP
         kokoro_server.TTS_WARMUP = False
+        self._offline_if_cached = kokoro_server.HF_OFFLINE_IF_CACHED
+        kokoro_server.HF_OFFLINE_IF_CACHED = True
         PIPE_CALLS.clear()
         SF_WRITES.clear()
         self._tmp = tempfile.mkdtemp()
@@ -77,19 +95,9 @@ class SingleVoiceTestBase(unittest.TestCase):
 
     def tearDown(self):
         kokoro_server.TTS_WARMUP = self._warmup
+        kokoro_server.HF_OFFLINE_IF_CACHED = self._offline_if_cached
         kokoro_server.pipeline = None
         kokoro_server.MODEL_LOADED = False
-
-    def make_handler(self):
-        # Same construction as ManagedLifetimeTests.make_handler: a bare
-        # handler instance around buffered streams.
-        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
-        handler.rfile = io.BytesIO(b'')
-        handler.wfile = FlushableBytesIO()
-        handler.send_response = MagicMock()
-        handler.send_header = MagicMock()
-        handler.end_headers = MagicMock()
-        return handler
 
 
 class SingleVoiceTests(SingleVoiceTestBase):
@@ -205,16 +213,7 @@ class SanitizeForSpeechTests(unittest.TestCase):
         self.assertEqual(kokoro_server.sanitize_for_speech('**Heading.'), 'Heading.')
 
 
-class OcrTtsStreamTests(unittest.TestCase):
-    def make_handler(self):
-        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
-        handler.rfile = io.BytesIO(b'')
-        handler.wfile = FlushableBytesIO()
-        handler.send_response = MagicMock()
-        handler.send_header = MagicMock()
-        handler.end_headers = MagicMock()
-        return handler
-
+class OcrTtsStreamTests(HandlerStubMixin, unittest.TestCase):
     def test_stream_sanitizes_text_audio_and_done_events(self):
         handler = self.make_handler()
         fragments = ['**Big heading**\n', '- first bullet 🎉\n', 'Plain tail.']
@@ -234,7 +233,7 @@ class OcrTtsStreamTests(unittest.TestCase):
         self.assertTrue(any(e['type'] == 'audio' and e['text'] == 'Big heading' for e in events))
 
 
-class ManagedLifetimeTests(unittest.TestCase):
+class ManagedLifetimeTests(HandlerStubMixin, unittest.TestCase):
     def setUp(self):
         # Reset globals each test so ordering can never leak state.
         self.orig_managed = kokoro_server.MANAGED
@@ -242,15 +241,6 @@ class ManagedLifetimeTests(unittest.TestCase):
 
     def tearDown(self):
         kokoro_server.MANAGED = self.orig_managed
-
-    def make_handler(self):
-        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
-        handler.rfile = io.BytesIO(b'')
-        handler.wfile = FlushableBytesIO()
-        handler.send_response = MagicMock()
-        handler.send_header = MagicMock()
-        handler.end_headers = MagicMock()
-        return handler
 
     def test_heartbeat_endpoint_updates_last_seen(self):
         handler = self.make_handler()
@@ -312,6 +302,15 @@ class ManagedLifetimeTests(unittest.TestCase):
         finally:
             kokoro_server.MODEL_LOADED = False
             kokoro_server.MANAGED = False
+
+    def test_health_reports_ollama_state(self):
+        handler = self.make_handler()
+        handler.path = '/health'
+        handler.headers = {}
+        with patch.object(kokoro_server, 'OLLAMA_STATE', 'starting'):
+            kokoro_server.TTSHandler.do_GET(handler)
+        body = json.loads(handler.wfile.getvalue())
+        self.assertEqual(body['ollama'], 'starting')
 
     def test_get_vision_api_bases_single_candidate_on_windows(self):
         # Windows never reads /proc/net/route, so only the loopback base remains.
@@ -424,19 +423,14 @@ class ConversationTests(unittest.TestCase):
             self.assertFalse(kokoro_server.is_cuda_error(TimeoutError('request timed out')))
 
 
-class HandlerTests(unittest.TestCase):
+class HandlerTests(HandlerStubMixin, unittest.TestCase):
     """Tests for HTTP handler routing."""
 
     def test_do_post_new_conversation_no_body_required(self):
         """Verify /new_conversation works without a JSON body (bug fix)."""
-        handler = kokoro_server.TTSHandler.__new__(kokoro_server.TTSHandler)
+        handler = self.make_handler()
         handler.path = '/new_conversation'
         handler.headers = {}
-        handler.rfile = io.BytesIO(b'')
-        handler.wfile = FlushableBytesIO()
-        handler.send_response = MagicMock()
-        handler.send_header = MagicMock()
-        handler.end_headers = MagicMock()
 
         # This should NOT raise a JSONDecodeError
         # The handler should route directly without parsing body
@@ -521,34 +515,20 @@ class DeferredHeavyImportsTests(SingleVoiceTestBase):
         self.assertEqual(len(SF_WRITES), 1)
 
 
-class BrokenDependencyTests(unittest.TestCase):
-    """Issue #2: a broken heavy dependency must fail model load (MODEL_LOADED
-    stays false) instead of being swallowed by the warmup. The real import
-    machinery is the boundary — a None entry in sys.modules makes both import
-    statements and importlib.import_module raise a genuine ImportError."""
+class BrokenDependencyTests(SingleVoiceTestBase):
+    """A broken kokoro import must fail model load with MODEL_LOADED staying
+    false. The real import machinery is the boundary — a None entry in
+    sys.modules raises a genuine ImportError on import. No separate numpy/
+    soundfile probes exist anymore: kokoro's own import chain pulls both in,
+    and since kokoro is cached in sys.modules after the first test session
+    import, a broken-module scenario is only reachable for kokoro itself
+    through get_pipeline()."""
 
-    def setUp(self):
-        kokoro_server.pipeline = None
-        kokoro_server.MODEL_LOADED = False
-        # Empty cache dir so the warm machine's cache can't flip HF_HUB_OFFLINE
-        # into the test-process env (see TtsWarmupTests.setUp, same patch).
-        self._tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
-        patcher = patch.object(kokoro_server, '_hf_cache_dir', return_value=Path(self._tmp))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def tearDown(self):
-        kokoro_server.pipeline = None
-        kokoro_server.MODEL_LOADED = False
-
-    def test_get_pipeline_propagates_broken_dependency(self):
-        for broken in ('soundfile', 'numpy'):
-            with self.subTest(module=broken), \
-                 patch.dict(sys.modules, {broken: None}), \
-                 self.assertRaises(ImportError):
-                kokoro_server.get_pipeline()
-            self.assertFalse(kokoro_server.MODEL_LOADED)
+    def test_get_pipeline_propagates_broken_kokoro_import(self):
+        with patch.dict(sys.modules, {'kokoro': None}), \
+             self.assertRaises(ImportError):
+            kokoro_server.get_pipeline()
+        self.assertFalse(kokoro_server.MODEL_LOADED)
 
     def test_load_model_logs_traceback_on_failure(self):
         with patch.dict(sys.modules, {'kokoro': None}), \
@@ -567,6 +547,10 @@ class HfOfflineGatingTests(unittest.TestCase):
     def setUp(self):
         kokoro_server.pipeline = None
         kokoro_server.MODEL_LOADED = False
+        # The flag is forced so an ambient HF_OFFLINE_IF_CACHED=0 can't turn
+        # the warm-cache test into a vacuous pass (finding #5).
+        self._offline_if_cached = kokoro_server.HF_OFFLINE_IF_CACHED
+        kokoro_server.HF_OFFLINE_IF_CACHED = True
         self._env_backup = {k: os.environ.get(k) for k in
                             ('HF_HUB_CACHE', 'HUGGINGFACE_HUB_CACHE', 'HF_HOME',
                              'XDG_CACHE_HOME', 'HF_HUB_OFFLINE')}
@@ -574,6 +558,7 @@ class HfOfflineGatingTests(unittest.TestCase):
         os.environ.pop('HF_HUB_OFFLINE', None)
 
     def tearDown(self):
+        kokoro_server.HF_OFFLINE_IF_CACHED = self._offline_if_cached
         for key, value in self._env_backup.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -625,13 +610,16 @@ class HfOfflineGatingTests(unittest.TestCase):
         with patch.dict(os.environ, {'HF_HUB_CACHE': '~/hfcache'}):
             self.assertEqual(kokoro_server._hf_cache_dir(), Path.home() / 'hfcache')
 
-    def _make_cache(self, root: Path, with_pth: bool = True) -> Path:
+    def _make_cache(self, root: Path, with_pth: bool = True, with_voice: bool = True) -> Path:
         slug = f"models--{kokoro_server.MODEL_REPO_ID.replace('/', '--')}"
         snapshot = root / slug / 'snapshots' / 'abc123'
         snapshot.mkdir(parents=True)
         (snapshot / 'config.json').write_text('{}')
         if with_pth:
             (snapshot / 'kokoro-v1_0.pth').write_bytes(b'weights')
+        if with_voice:
+            (snapshot / 'voices').mkdir()
+            (snapshot / 'voices' / f'{kokoro_server.DEFAULT_VOICE}.pt').write_bytes(b'voice')
         return root
 
     def test_kokoro_model_cached_true_when_snapshot_complete(self):
@@ -645,6 +633,24 @@ class HfOfflineGatingTests(unittest.TestCase):
             root = self._make_cache(Path(tmp), with_pth=False)
             with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
                 self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_kokoro_model_cached_false_when_voice_missing(self):
+        # The offline gate must not arm when the lazily-downloaded voice file
+        # (voices/af_bella.pt) is absent — HF_HUB_OFFLINE=1 would fail every
+        # /tts forever with no recovery.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp), with_voice=False)
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                self.assertFalse(kokoro_server._kokoro_model_cached())
+
+    def test_get_pipeline_leaves_offline_unset_when_voice_missing(self):
+        # Real-path proof: a weights-only cache must not arm HF_HUB_OFFLINE.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_cache(Path(tmp), with_voice=False)
+            with patch.object(kokoro_server, '_hf_cache_dir', return_value=root):
+                kokoro_server.get_pipeline()
+
+        self.assertNotIn('HF_HUB_OFFLINE', os.environ)
 
     def test_kokoro_model_cached_false_when_cache_missing(self):
         with patch.object(kokoro_server, '_hf_cache_dir',
@@ -701,6 +707,49 @@ class BackgroundTasksTests(unittest.TestCase):
         run.assert_called_once_with()
         self.assertTrue(any('[PHASE] ollama ensure took' in line for line in logs.output))
 
+    def test_ensure_ollama_swallows_and_logs_failures(self):
+        # Real boundary, no collaborator mock: a malformed VISION_API_BASE
+        # crashes get_vision_api_bases (parsed.port -> ValueError) before any
+        # Ollama probe. The background thread must log the traceback instead
+        # of dying with it on stderr only.
+        with patch.object(kokoro_server, 'VISION_API_BASE', 'http://127.0.0.1:abc'), \
+             self.assertLogs(level='ERROR') as logs:
+            kokoro_server.ensure_ollama()  # must not raise
+
+        self.assertTrue(any('[OLLAMA] ensure failed' in line for line in logs.output))
+        failed = [r for r in logs.records if '[OLLAMA] ensure failed' in r.getMessage()]
+        self.assertIsNotNone(failed[0].exc_info, 'expected a real traceback')
+
+    def test_ensure_ollama_running_marks_unavailable_when_missing(self):
+        # Not-found is a terminal branch: OLLAMA_STATE must land on
+        # 'unavailable' so the panel stops waiting on it. The network probe
+        # (_ollama_is_running) is an expensive external collaborator; the
+        # decision logic under test runs for real.
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=False), \
+             patch.object(kokoro_server.shutil, 'which', return_value=None):
+            kokoro_server.ensure_ollama_running()
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'unavailable')
+
+    def test_ensure_ollama_running_marks_ready_when_already_running(self):
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=True):
+            kokoro_server.ensure_ollama_running()
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'ready')
+
+    def test_ensure_ollama_running_marks_unavailable_on_startup_timeout(self):
+        # Ollama spawned but never answered within the bounded budget: a
+        # terminal 'unavailable', not an eternal 'starting'.
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch.object(kokoro_server, '_ollama_is_running', return_value=False), \
+             patch.object(kokoro_server.shutil, 'which', return_value='C:/ollama.exe'), \
+             patch.object(kokoro_server.subprocess, 'Popen', return_value=proc), \
+             patch.object(kokoro_server, 'OLLAMA_STARTUP_TIMEOUT', 0):
+            kokoro_server.ensure_ollama_running()
+
+        self.assertEqual(kokoro_server.OLLAMA_STATE, 'unavailable')
+
 
 class BrokenPipeline:
     """KPipeline that constructs fine but fails at synthesis time."""
@@ -712,33 +761,18 @@ class BrokenPipeline:
         raise RuntimeError('boom')
 
 
-class TtsWarmupTests(unittest.TestCase):
-    """Issue #8: get_pipeline() exercises the model with a throwaway request
-    before its first real use. The warmup runs inside get_pipeline under
-    pipeline_lock, so each test drives the real get_pipeline; only _hf_cache_dir
-    and TTS_WARMUP are patched."""
+class TtsWarmupTests(SingleVoiceTestBase):
+    """The warmup runs inside get_pipeline under pipeline_lock, so every test
+    drives the real get_pipeline over the faithful FakePipeline stub; only
+    data seams (_hf_cache_dir, TTS_WARMUP) are patched. The base setUp forces
+    TTS_WARMUP=False for request-level isolation — these tests re-enable it
+    after super().setUp(); the base tearDown restores the ambient value."""
 
     def setUp(self):
-        kokoro_server.pipeline = None
-        kokoro_server.MODEL_LOADED = False
-        PIPE_CALLS.clear()
-        SF_WRITES.clear()
-        self._warmup = kokoro_server.TTS_WARMUP
-        self._tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
-
-    def tearDown(self):
-        kokoro_server.TTS_WARMUP = self._warmup
-        kokoro_server.pipeline = None
-        kokoro_server.MODEL_LOADED = False
-
-    def _point_cache_at(self, path):
-        patcher = patch.object(kokoro_server, '_hf_cache_dir', return_value=Path(path))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        super().setUp()
+        kokoro_server.TTS_WARMUP = True
 
     def test_get_pipeline_warms_up_when_enabled(self):
-        self._point_cache_at(self._tmp)
         with self.assertLogs(level='INFO') as logs:
             kokoro_server.get_pipeline()
 
@@ -751,22 +785,25 @@ class TtsWarmupTests(unittest.TestCase):
 
     def test_get_pipeline_skips_warmup_when_disabled(self):
         kokoro_server.TTS_WARMUP = False
-        self._point_cache_at(self._tmp)
         with self.assertLogs(level='INFO') as logs:
             kokoro_server.get_pipeline()
 
         self.assertFalse(any('TTS warmup' in line for line in logs.output))
         self.assertEqual(PIPE_CALLS, [])
 
-    def test_get_pipeline_survives_warmup_failure(self):
-        self._point_cache_at(self._tmp)
+    def test_get_pipeline_raises_on_warmup_failure(self):
+        # A warmup failure is a load failure: MODEL_LOADED must stay false so
+        # the panel never goes online against a server whose every /tts would
+        # 500. (Replaces the old 'survives warmup failure' semantics.)
         with patch.dict(sys.modules, {'kokoro': types.SimpleNamespace(KPipeline=BrokenPipeline)}), \
+             self.assertRaises(RuntimeError), \
              self.assertLogs(level='INFO') as logs:
-            kokoro_server.get_pipeline()  # must not raise
+            kokoro_server.get_pipeline()
 
-        self.assertTrue(any('TTS warmup failed' in line for line in logs.output))
-        self.assertTrue(kokoro_server.MODEL_LOADED)
-        self.assertIsNotNone(kokoro_server.pipeline)
+        self.assertFalse(kokoro_server.MODEL_LOADED)
+        self.assertIsNone(kokoro_server.pipeline)
+        self.assertTrue(any('[PHASE] TTS warmup failed' in line for line in logs.output))
+        self.assertTrue(any('falling back to CPU' in line for line in logs.output))
 
 
 if __name__ == '__main__':

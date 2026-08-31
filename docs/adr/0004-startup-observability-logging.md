@@ -59,10 +59,12 @@ only which phase is measured where changes.
 - **New phases**: `[PHASE] ollama ensure` no longer runs on the model-loader thread; it
   moves to its own `ollama-ensure` daemon thread parallel to model load. `[PHASE] TTS warmup
   took Xms` brackets the post-load warmup synthesis, run inside `get_pipeline()` under
-  `pipeline_lock` after `MODEL_LOADED = True` — on the loader thread at startup, and on the
-  request thread after a CUDA-error-triggered reload. numpy/soundfile are probed during the
-  heavy-imports phase, so a broken dependency fails model load (panel stays offline) rather
-  than degrading silently.
+  `pipeline_lock`. `MODEL_LOADED` is set only after the warmup completes, and a warmup
+  failure fails model load (traceback in `logs/server.log`, panel stays offline) instead of
+  being warned-and-swallowed — the failure runs on the loader thread at startup, and on the
+  request thread after a CUDA-error-triggered reload. No separate numpy/soundfile probes
+  exist: kokoro's own import chain pulls both in, so a broken dependency fails the kokoro
+  import (panel stays offline) rather than degrading silently.
 - **`Ready at ... (startup X.XXs)`** is unchanged in format, but with the import cost off
   the module path it now measures time-to-HTTP-ready (~0.3s) rather than the former
   import-dominated total; the panel still gates on `model_loaded`, so panel-perceived

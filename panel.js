@@ -56,6 +56,9 @@ const START_POLL_MS = 500;
 const START_TIMEOUT_MS = 90000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 const HEARTBEAT_TIMEOUT_MS = 4000;
+// Bounded wait when the vision backend is still warming up (health 'starting')
+// before firing the first OCR request.
+const OCR_WAIT_TIMEOUT_MS = 10000;
 // The server is single-threaded: a heartbeat can queue behind an in-flight
 // /ocr_tts for a long time, so only 3 consecutive failures mean "offline".
 const HEARTBEAT_MAX_FAILURES = 3;
@@ -63,6 +66,37 @@ const NATIVE_HOST = 'com.vp1591.tts_server';
 
 let nativePort = null;
 let serverOnline = false;
+let lastHealth = null;
+
+// Ollama (the vision backend) warms up in parallel with the TTS model and
+// may lag model_loaded; firing OCR during that window burns ocr's retry
+// budget on a guaranteed failure. Values: 'ready' | 'starting' |
+// 'unavailable'; a server too old to send the field is treated as ready.
+function ocrLabel(d) {
+  if (d?.ollama === 'starting') return 'OCR warming up';
+  if (d?.ollama === 'unavailable') return 'OCR unavailable';
+  return 'OCR ready';
+}
+
+// Bounded pre-OCR wait that only runs for the genuinely transitional state.
+// Probe failure means the server is unreachable: proceed immediately and let
+// the request surface the real error instead of stalling.
+async function waitUntilOcrReady() {
+  if (lastHealth && lastHealth.ollama !== 'starting') return;
+  const deadline = Date.now() + OCR_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    setStatus('⏳ OCR warming up...', 'warn');
+    const d = await fetch(`${SERVER}/health`).then((r) => r.json()).catch(() => null);
+    if (d) {
+      lastHealth = d;
+      if (d.ollama !== 'starting') break;
+    } else {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, START_POLL_MS));
+  }
+  if (lastHealth) setStatus(`✓ Online — ${ocrLabel(lastHealth)} (${lastHealth?.vision || '?'})`, 'ok');
+}
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -141,7 +175,8 @@ async function checkHealth() {
 
 function goOnline(d) {
   serverOnline = true;
-  statusEl.textContent = `✓ Server online (${d?.vision || '?'})`;
+  lastHealth = d;
+  statusEl.textContent = `✓ Online — ${ocrLabel(d)} (${d?.vision || '?'})`;
   statusEl.className = 'status ok';
   btnRead.disabled = false;
   startHeartbeat();
@@ -172,6 +207,11 @@ btnRead.addEventListener('click', async () => {
   if (playing) { stop(); return; }
   errorEl.style.display = 'none';
   ocrTextEl.style.display = 'none';
+
+  // Ollama may still be warming up even though the TTS model is loaded; wait
+  // it out (bounded) pre-capture. waitUntilOcrReady only polls while health
+  // reports 'starting', so this is a no-op once Ollama is ready/unavailable.
+  await waitUntilOcrReady();
 
   // 1. Capture screenshot of the current tab
   btnRead.textContent = '📸 Capturing screen...';

@@ -9,7 +9,6 @@ GET  /health     -> status
 
 import argparse
 import base64
-import importlib
 import io
 import ipaddress
 import json
@@ -85,6 +84,9 @@ conv_lock = threading.Lock()
 pipeline = None
 pipeline_lock = threading.Lock()
 MODEL_LOADED = False
+# Tri-state readiness of the Ollama (vision) backend, published on /health so
+# the panel can wait out a cold start instead of burning the OCR retry budget.
+OLLAMA_STATE = 'starting'
 VISION_MODEL = os.environ.get('VISION_MODEL', 'gemma4:31b:cloud')
 VISION_API_BASE = os.environ.get('VISION_API_BASE', 'http://127.0.0.1:11434')
 VISION_API_KEY = os.environ.get('VISION_API_KEY', 'ollama')
@@ -232,13 +234,18 @@ def _hf_cache_dir() -> Path:
 
 
 def _kokoro_model_cached() -> bool:
-    """True when the Kokoro weights are already in the local HF cache, so no
-    network round-trip is needed and HF_HUB_OFFLINE can be set safely."""
+    """True when the Kokoro weights AND the pinned voice are already in the
+    local HF cache, so no network round-trip is needed and HF_HUB_OFFLINE can
+    be set safely. The voice file (voices/<name>.pt) is downloaded lazily at
+    synthesis time by kokoro, so a weights-only cache with HF_HUB_OFFLINE=1
+    would fail every /tts forever."""
     try:
         slug = f'models--{MODEL_REPO_ID.replace("/", "--")}'
         snapshots = _hf_cache_dir() / slug / 'snapshots'
         return any(
-            (d / 'config.json').is_file() and (d / 'kokoro-v1_0.pth').is_file()
+            (d / 'config.json').is_file()
+            and (d / 'kokoro-v1_0.pth').is_file()
+            and (d / 'voices' / f'{DEFAULT_VOICE}.pt').is_file()
             for d in snapshots.iterdir() if d.is_dir()
         )
     except OSError:
@@ -257,34 +264,37 @@ def get_pipeline():
                 if HF_OFFLINE_IF_CACHED and _kokoro_model_cached():
                     os.environ['HF_HUB_OFFLINE'] = '1'
                     logging.info("[SERVER] HF cache warm; HF_HUB_OFFLINE=1")
+                # No separate numpy/soundfile probes needed: kokoro's own
+                # import chain pulls both in, so a broken dependency fails the
+                # kokoro import right here; text_to_wav keeps its own imports
+                # for name binding.
                 from kokoro import KPipeline
-                # A broken numpy/soundfile must fail model load (MODEL_LOADED
-                # stays false) instead of being swallowed by the warmup and
-                # turning every /tts into a 500. importlib avoids an unused
-                # ruff import; text_to_wav keeps its own imports for names.
-                importlib.import_module('numpy')
-                importlib.import_module('soundfile')
             for device in ('cuda', 'cpu'):
                 try:
                     logging.info(f"[SERVER] Loading Kokoro model on {device}...")
                     t0 = time.monotonic()
                     pipeline = KPipeline(lang_code='a', repo_id=MODEL_REPO_ID, device=device)
                     model_load_ms = int((time.monotonic() - t0) * 1000)
-                    MODEL_LOADED = True
                     logging.info(f"[SERVER] Kokoro model loaded on {device} in {model_load_ms}ms.")
                     # Warmup lives here, under pipeline_lock, so it cannot
                     # race a real first request into a half-initialized pipe.
                     # Direct synthesis, not text_to_wav: that would re-enter
                     # get_pipeline and deadlock on the non-reentrant lock.
+                    # MODEL_LOADED is set only after the warmup validates the
+                    # model: a warmup failure is a load failure (panel stays
+                    # offline) — reporting healthy while every /tts would 500
+                    # is the worse failure mode.
                     if TTS_WARMUP:
-                        try:
-                            with _phase('TTS warmup'):
-                                for _ in pipeline('Hello.', voice=DEFAULT_VOICE):
-                                    pass
-                        except Exception as e:
-                            logging.warning(f"[SERVER] TTS warmup failed ({e}); skipping.")
+                        with _phase('TTS warmup'):
+                            for _ in pipeline('Hello.', voice=DEFAULT_VOICE):
+                                pass
+                    MODEL_LOADED = True
                     return pipeline
                 except Exception as e:
+                    # A failure after KPipeline() constructed (the warmup) must
+                    # not leave a half-valid global for a later request to skip
+                    # validation on.
+                    pipeline = None
                     if device == 'cuda':
                         logging.warning(f"[SERVER] CUDA failed ({e}); falling back to CPU...")
                         try:
@@ -405,14 +415,17 @@ def _ollama_is_running(api_base: str, timeout: float = 1.0) -> bool:
 
 def ensure_ollama_running() -> None:
     """Start a local Ollama server if the configured API routes are offline."""
+    global OLLAMA_STATE
     api_bases = get_vision_api_bases()
     if any(_ollama_is_running(api_base) for api_base in api_bases):
         logging.info(f"[OLLAMA] Already running at one of: {', '.join(api_bases)}")
+        OLLAMA_STATE = 'ready'
         return
 
     ollama_path = shutil.which('ollama')
     if not ollama_path:
         logging.warning("[OLLAMA] Command not found; OCR will require Ollama to be started manually.")
+        OLLAMA_STATE = 'unavailable'
         return
 
     log_path = Path(tempfile.gettempdir()) / 'kokoro_ollama.log'
@@ -432,6 +445,7 @@ def ensure_ollama_running() -> None:
     except OSError as e:
         log_file.close()
         logging.error(f"[OLLAMA] Failed to start Ollama: {e}")
+        OLLAMA_STATE = 'unavailable'
         return
 
     deadline = time.time() + OLLAMA_STARTUP_TIMEOUT
@@ -439,15 +453,18 @@ def ensure_ollama_running() -> None:
         if process.poll() is not None:
             logging.error(f"[OLLAMA] Ollama exited early with code {process.returncode}; see {log_path}")
             log_file.close()
+            OLLAMA_STATE = 'unavailable'
             return
         if any(_ollama_is_running(api_base) for api_base in api_bases):
             logging.info(f"[OLLAMA] Ready at one of: {', '.join(api_bases)}")
             log_file.close()
+            OLLAMA_STATE = 'ready'
             return
         time.sleep(0.5)
 
     logging.warning(f"[OLLAMA] Started but did not respond within {OLLAMA_STARTUP_TIMEOUT:.0f}s; see {log_path}")
     log_file.close()
+    OLLAMA_STATE = 'unavailable'
 
 
 def ocr_image_stream(image_bytes: bytes, constraints: str = '', history_turns: list | None = None):
@@ -645,7 +662,8 @@ class TTSHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
             self.send_json({'status': 'ok', 'model': 'kokoro-82M', 'vision': VISION_MODEL,
-                            'streaming': True, 'model_loaded': MODEL_LOADED, 'managed': MANAGED})
+                            'streaming': True, 'model_loaded': MODEL_LOADED, 'managed': MANAGED,
+                            'ollama': OLLAMA_STATE})
         elif self.path == '/conversation_state':
             self.handle_conversation_state()
         else:
@@ -878,8 +896,11 @@ def load_model():
 
 
 def ensure_ollama():
-    with _phase('ollama ensure'):
-        ensure_ollama_running()
+    try:
+        with _phase('ollama ensure'):
+            ensure_ollama_running()
+    except Exception as e:
+        logging.error(f"[OLLAMA] ensure failed ({e})", exc_info=True)
 
 
 def start_background_tasks():
